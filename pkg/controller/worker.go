@@ -94,6 +94,32 @@ const externalCreateRecoveryGracePeriod = 2 * time.Minute
 // period. A var (not const) only so tests can drive the requeue without a real delay.
 var externalCreateRecoveryReobserveInterval = 15 * time.Second
 
+// externalResourceExists answers whether the external resource exists, for incomplete-create
+// recovery only.
+//
+// It prefers an ExistenceChecker when the client implements one, because that is the narrow
+// question recovery needs. Observe is the fallback, and it is a poor proxy: it also reports
+// convergence, so a client whose Observe does repair work (a helm reconcile, say) returns an error
+// whenever convergence fails — for reasons that say nothing about whether the create landed.
+// Recovery then treats that as "cannot determine the result" and refuses forever, which wedges the
+// resource and stops the reconcile that would have fixed the convergence failure in the first
+// place. See ExistenceChecker for the case that motivated this.
+func (c *Controller) externalResourceExists(ctx context.Context, el *unstructured.Unstructured) (bool, error) {
+	if c.externalClient == nil {
+		return false, errors.New("no external client registered")
+	}
+
+	if checker, ok := c.externalClient.(ExistenceChecker); ok {
+		return checker.Exists(ctx, el)
+	}
+
+	obs, err := c.externalClient.Observe(ctx, el)
+	if err != nil {
+		return false, err
+	}
+	return obs.ResourceExists, nil
+}
+
 func (c *Controller) recordMetric(evt ctrlevent.Event, operation string, err error) {
 	result := "success"
 	if err != nil {
@@ -336,11 +362,7 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 	//   - resource is present => the create actually succeeded but we lost the
 	//                           success marker; record success and proceed.
 	if meta.ExternalCreateIncomplete(el) {
-		obs := ExternalObservation{}
-		obsErr := errors.New("no external client registered")
-		if c.externalClient != nil {
-			obs, obsErr = c.externalClient.Observe(ctx, el)
-		}
+		resourceExists, obsErr := c.externalResourceExists(ctx, el)
 
 		if obsErr != nil {
 			lg.Warn(errCreateIncomplete)
@@ -369,9 +391,9 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 			return nil
 		}
 
-		// Observe succeeded: reconcile the create-tracking annotations with the
+		// The existence question was answered: reconcile the create-tracking annotations with the
 		// observed reality, then fall through to normal processing.
-		if obs.ResourceExists {
+		if resourceExists {
 			meta.SetExternalCreateSucceeded(el, time.Now())
 		} else if meta.ExternalCreatePendingDuring(el, externalCreateRecoveryGracePeriod) {
 			// Confirm-the-negative before recreating: an external Create that DID land may not yet be
@@ -406,7 +428,7 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 			c.recordEvent(el, event.Warning(reasonCannotUpdateManaged, actionProcessEvent, err))
 			return err
 		}
-		lg.Info("Recovered from incomplete external create via observe", "resourceExists", obs.ResourceExists)
+		lg.Info("Recovered from incomplete external create", "resourceExists", resourceExists)
 	}
 
 	if !meta.WasDeleted(el) {

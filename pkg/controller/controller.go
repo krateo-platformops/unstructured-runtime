@@ -53,6 +53,31 @@ type ExternalClient interface {
 	Delete(ctx context.Context, mg *unstructured.Unstructured) error
 }
 
+// An ExistenceChecker answers the one question incomplete-create recovery actually asks: did the
+// external resource get created?
+//
+// Recovery otherwise falls back to Observe, which answers a broader question — does it exist AND is
+// it converged. For some clients that second half does real work that can fail for reasons having
+// nothing to do with existence, and then recovery misreads a convergence failure as "we cannot
+// determine whether the create landed" and refuses. Permanently: the resource stays wedged, so the
+// reconcile that would repair the underlying problem never runs again, and the controller can never
+// recover from the very failure that wedged it.
+//
+// The concrete case: composition-dynamic-controller's Observe runs a full helm reconcile including
+// a self-heal apply. A composition missing one permission fails that apply on every attempt, so
+// Observe never succeeds and recovery never resolves — even though "does the helm release exist?"
+// is cheap, reliable, and already answered earlier in that same function
+// (krateo-platformops/core-provider#110, #130).
+//
+// Implement this on an ExternalClient that can answer cheaply without doing the convergence work.
+// Recovery prefers it and uses Observe only when it is absent, so this is purely additive: an
+// ExternalClient that does not implement it behaves exactly as before.
+type ExistenceChecker interface {
+	// Exists reports whether the external resource for mg exists. It must not attempt to converge,
+	// repair or otherwise mutate anything — a failure to converge is not an answer to this question.
+	Exists(ctx context.Context, mg *unstructured.Unstructured) (bool, error)
+}
+
 // An ExternalObservation is the result of an observation of an external resource.
 type ExternalObservation struct {
 	// ResourceExists must be true if a corresponding external resource exists
