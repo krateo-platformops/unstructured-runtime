@@ -21,6 +21,9 @@ const (
 	ReasonCreating    string = "Creating"
 	ReasonDeleting    string = "Deleting"
 	ReasonInstalled   string = "Installed"
+	// ReasonZeroEvidence: readiness could not be assessed AT ALL — every signal the controller
+	// knows how to read was absent, not negative. See ZeroEvidence.
+	ReasonZeroEvidence string = "ZeroEvidence"
 )
 
 // Reasons a resource is or is not synced.
@@ -78,6 +81,36 @@ func Available() metav1.Condition {
 		Status:             metav1.ConditionTrue,
 		LastTransitionTime: metav1.Now(),
 		Reason:             ReasonAvailable,
+	}
+}
+
+// ZeroEvidence returns a condition that indicates readiness could not be assessed at all: every
+// signal the controller knows how to read was ABSENT, so neither True nor False is supportable and
+// the status is Unknown.
+//
+// It is NOT "unhealthy" and NOT a milder Unavailable. Unavailable means the resource was observed
+// and found sick; this means it was not observed. The two call for opposite handling: a consumer
+// gating on readiness must wait on Unavailable, while waiting on ZeroEvidence would wait forever,
+// because absence of evidence is normally a steady state rather than a transient one.
+//
+// The trap it exists to avoid, and the reason the status is Unknown rather than False: the
+// composition child-health rollup counts children whose kind it cannot interpret and, when EVERY
+// child is uninterpretable, has been reporting Available over nothing at all
+// (krateo-platformops/core-provider#165). Reporting False instead would be just as untrue and far
+// more damaging — consumers gating on readiness would block indefinitely on resources that are, as
+// far as anyone knows, fine.
+//
+// The REASON is the contract, not the status. A consumer that can distinguish this case may treat
+// it as passable; one that cannot keeps testing for True and is no worse off than before, which is
+// what makes this additive rather than a change to readiness semantics. Consumers must key on the
+// reason — never on bare Unknown, since a genuinely converging resource also reports Unknown and
+// must keep blocking, and never on the message text, which is prose.
+func ZeroEvidence() metav1.Condition {
+	return metav1.Condition{
+		Type:               TypeReady,
+		Status:             metav1.ConditionUnknown,
+		LastTransitionTime: metav1.Now(),
+		Reason:             ReasonZeroEvidence,
 	}
 }
 
