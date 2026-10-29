@@ -472,6 +472,30 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 	lg.Debug("Start processing")
 	switch evt.EventType {
 	case ctrlevent.Create:
+		// WasDeleted gates the finalizer-ADD above; it never gated this dispatch. So a Create
+		// queued before the object acquired a deletionTimestamp — or requeued after a restart —
+		// was still dispatched, and handleCreate called externalClient.Create on an object that is
+		// being deleted. Observed on a live cluster: THREE creates after the deletionTimestamp,
+		// interleaved with the delete attempts, because it re-dispatches for as long as the delete
+		// is in flight rather than once.
+		//
+		// Harmless only while the external API refuses the create. When it SUCCEEDS the sequence is
+		// create succeeds -> delete completes -> finalizer released -> CR reaped -> the external
+		// resource remains with nothing referencing it, and its identifier may never have been
+		// persisted because the create's status write races the deletion. On billable resources
+		// that is an unbounded leak, one orphan per reconcile, that no later reconcile can notice
+		// because the object that would have pointed at it is gone.
+		//
+		// Dropped rather than requeued: the object is going away, so there is no later moment at
+		// which creating it becomes correct. Deliberately narrow — Update and Observe are left
+		// dispatching, because an update during deletion is wasteful rather than destructive and
+		// the create-recovery path above intentionally reconciles objects in odd states.
+		if meta.WasDeleted(el) {
+			lg.Debug("Dropping a Create event for an object that is being deleted; creating an "+
+				"external resource now would orphan it once the object is reaped",
+				"deletion-timestamp", el.GetDeletionTimestamp())
+			return nil
+		}
 		err = c.handleCreate(ctx, evt.ObjectRef)
 		c.recordMetric(evt, "create", err)
 		return err
