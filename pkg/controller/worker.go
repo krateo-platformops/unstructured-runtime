@@ -345,6 +345,26 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 				return err
 			}
 		}
+		// The policy is "do not touch the external resource", so this pass is DONE. Without this
+		// return, execution falls through to the dispatch below with WasDeleted(el) still true —
+		// and a pending delete is enqueued as EventType Delete (controller.go, UpdateFunc: "the
+		// resource has a deletion timestamp but was not effectively deleted yet"). That lands in
+		// handleDelete, whose fetch is a LIVE apiserver Get, and then calls externalClient.Delete:
+		// the external resource is destroyed on the very pass that honoured the orphan policy.
+		//
+		// Whether it was destroyed depended on whether the object had already been reaped, which
+		// is decided by finalizer MULTIPLICITY rather than by timing. Measured over 400 trials on
+		// two apiserver versions (kind v1.35.0 and GKE v1.37.1, identical results):
+		//
+		//   orphan, this finalizer alone   0/160  — removing the last finalizer completes the
+		//                                           deletion inside that same update request, so
+		//                                           the fetch 404s and Delete is never reached
+		//   orphan + any other finalizer   40/40  — the object survives our removal, the fetch
+		//                                           succeeds, and the external resource is deleted
+		//
+		// No gradient and no window to widen: completely safe, or completely unsafe, decided by a
+		// precondition nothing enforces. See krateo-platformops/unstructured-runtime#23.
+		return nil
 	}
 
 	// If we started but never completed creation of an external resource we may
