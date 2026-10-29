@@ -170,3 +170,61 @@ func TestProcessItem_OrphanWithSoleFinalizer_DoesNotDeleteExternalResource(t *te
 		"the orphan branch must return before any external call: observing a resource the policy "+
 			"says to leave alone is wasted work and, for helm, not free")
 }
+
+// #25 (oasgen-provider#279). A Create event queued before the object acquired a deletionTimestamp
+// — or requeued after a restart — was still dispatched, so externalClient.Create ran on an object
+// that is being deleted. Measured on a live cluster: three creates after the deletionTimestamp,
+// interleaved with the delete attempts.
+//
+// Asserts the SIDE EFFECT, not the local object, for the same reason TestProcessItem_DeleteOrphan
+// sat green for months while the orphan fall-through shipped: a test that checks what happened to
+// the in-memory object cannot see an external call that should not have been made. That needs a
+// recording client, which the shared fakeExternalClient cannot be — it only returns canned errors.
+func TestProcessItem_CreateEventOnADeletingObject_DoesNotCreateExternalResource(t *testing.T) {
+	sid, err := shortid.New(1, shortid.DefaultABC, 2342)
+	require.NoError(t, err)
+	opts := createTestOptions()
+	rec := &recordingExternalClient{}
+	ctrl, err := New(sid, opts)
+	require.NoError(t, err)
+	ctrl.externalClient = rec
+
+	// A normal deletion-policy object (NOT orphan): WasDeleted is true and ShouldDelete is true, so
+	// the orphan early-return does not apply and execution reaches the dispatch — which is exactly
+	// the window this defect lived in.
+	obj := createTestUnstructured("deleting-create", opts.Namespace)
+	created, err := opts.Client.Resource(opts.GVR).Namespace(opts.Namespace).
+		Create(context.TODO(), obj, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	now := metav1.Now()
+	created.SetDeletionTimestamp(&now)
+	created.SetFinalizers([]string{finalizerName})
+	_, err = opts.Client.Resource(opts.GVR).Namespace(opts.Namespace).
+		Update(context.TODO(), created, metav1.UpdateOptions{})
+	require.NoError(t, err)
+
+	cur, err := opts.Client.Resource(opts.GVR).Namespace(opts.Namespace).
+		Get(context.TODO(), created.GetName(), metav1.GetOptions{})
+	require.NoError(t, err)
+
+	// PREMISE CHECKS. Without both, this test could pass by never entering the dispatch at all.
+	require.True(t, meta.WasDeleted(cur), "premise: the object must be mid-deletion")
+	require.True(t, meta.ShouldDelete(cur),
+		"premise: ShouldDelete must be TRUE here, or the orphan early-return handles this and the "+
+			"dispatch — the branch under test — is never reached")
+
+	err = ctrl.processItem(context.TODO(), ctrlevent.Event{
+		EventType: ctrlevent.Create,
+		ObjectRef: objectref.ObjectRef{
+			APIVersion: cur.GetAPIVersion(), Kind: cur.GetKind(),
+			Name: cur.GetName(), Namespace: cur.GetNamespace(),
+		},
+	})
+	require.NoError(t, err)
+
+	require.Zero(t, rec.created,
+		"externalClient.Create was called for an object with a deletionTimestamp: the resource it "+
+			"creates is orphaned the moment the CR is reaped, and nothing will ever reference it "+
+			"again (#25)")
+}
