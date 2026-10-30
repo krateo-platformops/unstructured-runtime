@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"k8s.io/client-go/util/retry"
 	"time"
 
 	"github.com/krateo-platformops/plumbing/kubeutil/event"
@@ -413,8 +414,22 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 
 		// The existence question was answered: reconcile the create-tracking annotations with the
 		// observed reality, then fall through to normal processing.
+		// Which annotation mutation to apply, captured as a closure rather than applied here.
+		// #28: the write below used to be a bare tools.Update on `el` — the object fetched BEFORE
+		// externalResourceExists ran. That call falls through to the client's Observe when the
+		// client does not implement ExistenceChecker, and a client whose Observe writes (the status
+		// subresource is enough) bumps resourceVersion server-side. `el` is then stale, the write
+		// conflicts, and because the error returns BEFORE the dispatch below, no Create/Update ever
+		// runs: the resource stays external-create-pending forever and its spec is never pushed.
+		// Measured on rest-dynamic-controller: 51 consecutive conflicts, 0 recoveries, in 20 minutes.
+		//
+		// The mutation must be re-applied to a FRESHLY FETCHED object on each attempt. Retrying the
+		// stale `el` would succeed and clobber whatever the Observe just wrote, trading a wedge for
+		// data loss — so a retry that reuses the object is worse than no retry at all.
+		var mutate func(*unstructured.Unstructured)
+
 		if resourceExists {
-			meta.SetExternalCreateSucceeded(el, time.Now())
+			mutate = func(o *unstructured.Unstructured) { meta.SetExternalCreateSucceeded(o, time.Now()) }
 		} else if meta.ExternalCreatePendingDuring(el, externalCreateRecoveryGracePeriod) {
 			// Confirm-the-negative before recreating: an external Create that DID land may not yet be
 			// visible in an eventually-consistent external API. While the create attempt is still
@@ -437,16 +452,30 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 			})
 			return nil
 		} else {
-			meta.RemoveAnnotations(el, meta.AnnotationKeyExternalCreatePending)
+			mutate = func(o *unstructured.Unstructured) {
+				meta.RemoveAnnotations(o, meta.AnnotationKeyExternalCreatePending)
+			}
 		}
-		el, err = tools.Update(ctx, el, tools.UpdateOptions{
-			Pluralizer:    c.pluralizer,
-			DynamicClient: c.dynamicClient,
-		})
-		if err != nil {
-			lg.Error(err, "Cannot reconcile external-create annotations after incomplete create")
-			c.recordEvent(el, event.Warning(reasonCannotUpdateManaged, actionProcessEvent, err))
-			return err
+
+		if rerr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			fresh, ferr := c.fetch(ctx, evt.ObjectRef, false)
+			if ferr != nil {
+				return ferr
+			}
+			mutate(fresh)
+			updated, uerr := tools.Update(ctx, fresh, tools.UpdateOptions{
+				Pluralizer:    c.pluralizer,
+				DynamicClient: c.dynamicClient,
+			})
+			if uerr != nil {
+				return uerr
+			}
+			el = updated
+			return nil
+		}); rerr != nil {
+			lg.Error(rerr, "Cannot reconcile external-create annotations after incomplete create")
+			c.recordEvent(el, event.Warning(reasonCannotUpdateManaged, actionProcessEvent, rerr))
+			return rerr
 		}
 		lg.Info("Recovered from incomplete external create", "resourceExists", resourceExists)
 	}
