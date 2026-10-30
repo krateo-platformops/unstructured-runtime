@@ -571,6 +571,24 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 		return err
 	}
 
+	// Apply whatever the handler asked to be recorded. AFTER this re-fetch, deliberately: the
+	// fetch replaces `el`, so conditions set before it are silently discarded — which is the first
+	// thing I got wrong implementing core-provider#258.
+	//
+	// A handler cannot do this itself. Observe receives a deep copy (handlers copy to keep Observe
+	// a read phase), so anything written there never leaves the function. Returning them instead
+	// means they ride the single status write below rather than needing one of their own.
+	//
+	// A failure here is logged and does NOT abort the observation: a condition that cannot be
+	// recorded must not turn a successful observe into an error, which is the shape that wedges a
+	// resource.
+	if len(observation.Conditions) > 0 {
+		if cerr := unstructuredtools.SetConditions(el, observation.Conditions...); cerr != nil {
+			log.Error(cerr, "Cannot set conditions returned by the external client")
+			c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, cerr))
+		}
+	}
+
 	if !observation.ResourceExists {
 		item := ctrlevent.Event{
 			EventType: ctrlevent.Create,

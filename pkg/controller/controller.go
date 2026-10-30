@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sync"
 	"time"
 
@@ -88,6 +89,24 @@ type ExternalObservation struct {
 	// appears to be up-to-date - i.e. updating the external resource to match
 	// the desired state of the managed resource would be a no-op.
 	ResourceUpToDate bool
+
+	// Conditions the handler wants recorded for this observation. The runtime applies them to the
+	// object BEFORE its own status write, so they ride that single write.
+	//
+	// This exists because a handler CANNOT report a condition by writing one itself. Observe is a
+	// read phase and handlers deep-copy their argument to keep it so, which means anything they
+	// write is discarded. And a handler that wrote status anyway would be worse than one that
+	// stayed silent: this runtime does fetch -> Observe -> SetConditions -> UpdateStatus, so a
+	// write from inside Observe leaves the runtime's own object at a stale resourceVersion and its
+	// UpdateStatus then 409s on EVERY reconcile, turning a missing condition into a permanent
+	// ReconcileError (core-provider#258).
+	//
+	// So: return what you want recorded, never write it. Nil and empty are equivalent and are the
+	// behaviour every existing handler already has.
+	//
+	// Applied with Upsert semantics, keyed on Type, so a handler owns the condition types it
+	// returns and the runtime continues to own Synced.
+	Conditions []metav1.Condition
 }
 
 type ListWatcherConfiguration struct {
