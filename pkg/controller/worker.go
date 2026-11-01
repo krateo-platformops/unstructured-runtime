@@ -1004,8 +1004,27 @@ func (c *Controller) handleDelete(ctx context.Context, ref objectref.ObjectRef) 
 		return err
 	}
 
-	log.Info("Successfully requested deletion of external resource")
-	c.recordEvent(el, event.Normal(reasonDeleted, actionDeleteEvent, "Successfully requested deletion of external resource"))
+	// "External resource is gone", NOT "deletion requested" — because a nil from Delete establishes
+	// only the first (#34).
+	//
+	// externalClient.Delete is called unconditionally above: there is no Observe-reported-present
+	// precondition, so nil means EITHER the client deleted it OR it was already absent, and at this
+	// point the runtime cannot tell which. Claiming a request was made is an assertion about our own
+	// action that the return value does not support.
+	//
+	// Measured by the aruba-provider-kog session on a run where ZERO DELETE requests reached the
+	// vendor API for the whole lifetime of the CR (148 GETs, 1 POST, 0 DELETEs). An operator removed
+	// the resource by hand; the next verification found it absent, returned nil, and the runtime
+	// logged that it had requested the deletion. Everything it DID was correct — only the sentence
+	// was wrong, and an operator reading it concludes the controller removed the resource.
+	//
+	// DO NOT "fix" the identical sentence in provider-runtime's reconciler to match. It is correct
+	// there, and for a reason that is not the wording: that path fires only after Observe reported
+	// the resource PRESENT, then requeues to verify while holding the finalizer. Already-gone never
+	// reaches it, because Observe reports absent and Delete is never called. The precondition is
+	// what makes the claim true, and this path has none.
+	log.Info("External resource is gone; releasing finalizer")
+	c.recordEvent(el, event.Normal(reasonDeleted, actionDeleteEvent, "External resource is gone; releasing finalizer"))
 	return nil
 }
 
