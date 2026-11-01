@@ -308,7 +308,21 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 
 		log.Debug("Reconciliation is paused via the pause annotation")
 		c.recordEvent(el, event.Normal(reasonReconciliationPaused, actionProcessEvent, "Reconciliation is paused via the pause annotation"))
-		err = unstructuredtools.SetConditions(el, condition.ReconcilePaused())
+		// BOTH conditions (core-provider#241). ReconcilePaused sets only Synced, so Ready kept
+		// whatever the handler wrote before the pause — measured on krateo-057 as
+		// Ready=True/Available sitting beside Synced=False/ReconcilePaused on a composition carrying
+		// krateo.io/paused. A consumer reading Ready could not tell a paused resource from a
+		// converging one, and 66 of 185 compositions on one production estate are in that state.
+		//
+		// This is the one place the runtime speaks for Ready. Elsewhere a handler owns the types it
+		// returns and the runtime owns only Synced — but here the runtime short-circuits BEFORE
+		// calling the handler, so there is no verdict to defer to and nothing else can refresh Ready.
+		//
+		// ReadyPaused keeps Status=True deliberately: a paused resource is still available, it is
+		// merely not converging. Flipping it to False would make a deliberate pause look like an
+		// outage and could stall every dependent — that is the verdict change #241 leaves open, and
+		// it is not this.
+		err = unstructuredtools.SetConditions(el, condition.ReconcilePaused(), condition.ReadyPaused())
 		if err != nil {
 			log.Error(err, "Cannot set condition")
 			c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))

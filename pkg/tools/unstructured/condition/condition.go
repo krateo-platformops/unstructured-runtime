@@ -24,6 +24,10 @@ const (
 	// ReasonZeroEvidence: readiness could not be assessed AT ALL — every signal the controller
 	// knows how to read was absent, not negative. See ZeroEvidence.
 	ReasonZeroEvidence string = "ZeroEvidence"
+	// ReasonReconcilePausedReady: Ready is being reported for a resource whose reconciliation is
+	// PAUSED, so the value is the last one observed and is not being refreshed. Status stays True —
+	// a paused resource is still available, it just is not converging (core-provider#241).
+	ReasonReconcilePausedReady string = "ReconcilePaused"
 )
 
 // Reasons a resource is or is not synced.
@@ -50,6 +54,31 @@ func Creating() metav1.Condition {
 		Status:             metav1.ConditionFalse,
 		LastTransitionTime: metav1.Now(),
 		Reason:             ReasonCreating,
+	}
+}
+
+// ReadyPaused returns the Ready condition for a resource whose reconciliation is paused.
+//
+// Status stays TRUE: a paused resource is still available, it simply is not converging, and flipping
+// it to False would make a deliberate pause look like an outage and could stall every dependent.
+// What changes is the REASON, so that a consumer able to read it can tell the two apart
+// (core-provider#241).
+//
+// This exists because the paused path is the one place the runtime must speak for Ready. Everywhere
+// else the handler owns the types it returns and the runtime owns only Synced — but when paused the
+// runtime short-circuits BEFORE calling the handler, so there is no handler verdict to defer to and
+// Ready would otherwise keep whatever value was written before the pause. Measured on krateo-057: a
+// composition carrying krateo.io/paused reported Ready=True/Available with Synced=False/
+// ReconcilePaused beside it, because ReconcilePaused only ever set Synced.
+//
+// That stale Available is not a wrong computation — it is a correct value that stopped being
+// refreshed, which is indistinguishable from a healthy one from outside.
+func ReadyPaused() metav1.Condition {
+	return metav1.Condition{
+		Type:               TypeReady,
+		Status:             metav1.ConditionTrue,
+		LastTransitionTime: metav1.Now(),
+		Reason:             ReasonReconcilePausedReady,
 	}
 }
 
