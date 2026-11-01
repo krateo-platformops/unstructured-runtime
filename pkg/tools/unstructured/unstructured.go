@@ -68,7 +68,19 @@ func SetConditions(un *unstructured.Unstructured, conds ...metav1.Condition) err
 	return unstructured.SetNestedField(un.Object, res, "status", "conditions")
 }
 
-// GetConditions returns the conditions, excluding the `message` field.
+// GetConditions returns the conditions on un.
+//
+// The message IS included, despite what this comment said until now — the loop below populates
+// `Message: message`. The stale "excluding the `message` field" wording nearly became a root cause:
+// core-provider's setReadyCondition short-circuits on `cur.Message == message`, so "the message is
+// stripped here" would have explained a condition being rewritten on every reconcile exactly, and I
+// believed it from the comment before reading the code three lines down.
+//
+// ALL-OR-NOTHING ON PARSE FAILURE, which is the real hazard in here. Any condition whose
+// `lastTransitionTime` is absent or not RFC3339 makes this return nil for ALL conditions — so a
+// caller asking about Ready gets nothing because Synced was malformed, and a short-circuit keyed on
+// the result then fails open. Worth fixing separately; noted here because the signature gives no
+// hint of it.
 func GetConditions(un *unstructured.Unstructured) []metav1.Condition {
 	if un == nil {
 		return nil
