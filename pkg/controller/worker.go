@@ -328,7 +328,7 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 			c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))
 			return err
 		}
-		el, err := tools.UpdateStatus(ctx, el, tools.UpdateOptions{
+		el, err := tools.PatchStatusConditions(ctx, el, tools.UpdateOptions{
 			Pluralizer:    c.pluralizer,
 			DynamicClient: c.dynamicClient,
 		})
@@ -413,7 +413,7 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 				return err
 			}
 
-			el, err = tools.UpdateStatus(ctx, el, tools.UpdateOptions{
+			el, err = tools.PatchStatusConditions(ctx, el, tools.UpdateOptions{
 				Pluralizer:    c.pluralizer,
 				DynamicClient: c.dynamicClient,
 			})
@@ -596,7 +596,7 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 			return err
 		}
 
-		e, err = tools.UpdateStatus(ctx, e, tools.UpdateOptions{
+		e, err = tools.PatchStatusConditions(ctx, e, tools.UpdateOptions{
 			Pluralizer:    c.pluralizer,
 			DynamicClient: c.dynamicClient,
 		})
@@ -671,7 +671,7 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 			c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))
 			return err
 		}
-		el, err = tools.UpdateStatus(ctx, el, tools.UpdateOptions{
+		el, err = tools.PatchStatusConditions(ctx, el, tools.UpdateOptions{
 			Pluralizer:    c.pluralizer,
 			DynamicClient: c.dynamicClient,
 		})
@@ -725,7 +725,7 @@ func (c *Controller) handleCreate(ctx context.Context, ref objectref.ObjectRef) 
 			c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))
 			return err
 		}
-		el, err = tools.UpdateStatus(ctx, el, tools.UpdateOptions{
+		el, err = tools.PatchStatusConditions(ctx, el, tools.UpdateOptions{
 			Pluralizer:    c.pluralizer,
 			DynamicClient: c.dynamicClient,
 		})
@@ -777,7 +777,7 @@ func (c *Controller) handleCreate(ctx context.Context, ref objectref.ObjectRef) 
 			c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))
 			return err
 		}
-		el, err = tools.UpdateStatus(ctx, el, tools.UpdateOptions{
+		el, err = tools.PatchStatusConditions(ctx, el, tools.UpdateOptions{
 			Pluralizer:    c.pluralizer,
 			DynamicClient: c.dynamicClient,
 		})
@@ -815,7 +815,7 @@ func (c *Controller) handleCreate(ctx context.Context, ref objectref.ObjectRef) 
 			c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))
 			return err
 		}
-		el, err = tools.UpdateStatus(ctx, el, tools.UpdateOptions{
+		el, err = tools.PatchStatusConditions(ctx, el, tools.UpdateOptions{
 			Pluralizer:    c.pluralizer,
 			DynamicClient: c.dynamicClient,
 		})
@@ -840,7 +840,7 @@ func (c *Controller) handleCreate(ctx context.Context, ref objectref.ObjectRef) 
 		c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))
 		return err
 	}
-	el, err = tools.UpdateStatus(ctx, el, tools.UpdateOptions{
+	el, err = tools.PatchStatusConditions(ctx, el, tools.UpdateOptions{
 		Pluralizer:    c.pluralizer,
 		DynamicClient: c.dynamicClient,
 	})
@@ -890,7 +890,7 @@ func (c *Controller) handleUpdate(ctx context.Context, ref objectref.ObjectRef) 
 			return err
 		}
 
-		el, err = tools.UpdateStatus(ctx, e, tools.UpdateOptions{
+		el, err = tools.PatchStatusConditions(ctx, e, tools.UpdateOptions{
 			Pluralizer:    c.pluralizer,
 			DynamicClient: c.dynamicClient,
 		})
@@ -915,7 +915,7 @@ func (c *Controller) handleUpdate(ctx context.Context, ref objectref.ObjectRef) 
 		c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))
 		return err
 	}
-	el, err = tools.UpdateStatus(ctx, el, tools.UpdateOptions{
+	el, err = tools.PatchStatusConditions(ctx, el, tools.UpdateOptions{
 		Pluralizer:    c.pluralizer,
 		DynamicClient: c.dynamicClient,
 	})
@@ -959,7 +959,7 @@ func (c *Controller) handleDelete(ctx context.Context, ref objectref.ObjectRef) 
 			c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))
 			return err
 		}
-		el, err = tools.UpdateStatus(ctx, el, tools.UpdateOptions{
+		el, err = tools.PatchStatusConditions(ctx, el, tools.UpdateOptions{
 			Pluralizer:    c.pluralizer,
 			DynamicClient: c.dynamicClient,
 		})
@@ -983,7 +983,7 @@ func (c *Controller) handleDelete(ctx context.Context, ref objectref.ObjectRef) 
 		c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))
 		return err
 	}
-	el, err = tools.UpdateStatus(ctx, el, tools.UpdateOptions{
+	el, err = tools.PatchStatusConditions(ctx, el, tools.UpdateOptions{
 		Pluralizer:    c.pluralizer,
 		DynamicClient: c.dynamicClient,
 	})
