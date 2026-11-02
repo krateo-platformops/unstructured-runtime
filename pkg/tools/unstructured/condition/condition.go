@@ -143,18 +143,57 @@ func ZeroEvidence() metav1.Condition {
 	}
 }
 
+// Upsert replaces the condition of co's Type, or appends it.
+//
+// IT PRESERVES LastTransitionTime WHEN Status IS UNCHANGED (#36). Before this it assigned co
+// wholesale, so every reconcile that merely RE-ASSERTED a condition re-stamped the timestamp — and
+// a timestamp that moves without a transition is not a slightly-wrong timestamp, it is the opposite
+// of what the field means. An operator reading it concluded "became Synced just now" for a resource
+// that had been Synced for hours.
+//
+// Keyed on Status alone, deliberately, per the Kubernetes API convention: lastTransitionTime is
+// "the last time the condition transitioned from one status to another". A reason or message change
+// at the SAME status is not a transition — it is a better explanation of an unchanged state — so it
+// updates the text and leaves the timestamp where the transition actually happened.
+//
+// This does not make a caller's write idempotent. The condition is still replaced, so the object
+// still changes and resourceVersion still moves; what stops is the LIE about when the state began.
+// Avoiding the write entirely is the caller's job, and a caller that compares reason/message/status
+// before writing (core-provider's setReadyCondition) is the complementary half — see
+// core-provider#298, where three phases supplied three messages for one state so that guard could
+// never fire.
 func Upsert(conds *[]metav1.Condition, co metav1.Condition) {
 	for idx, el := range *conds {
-		if el.Type == co.Type {
-			(*conds)[idx] = co
-			return
+		if el.Type != co.Type {
+			continue
 		}
+		if el.Status == co.Status && !el.LastTransitionTime.IsZero() {
+			// Same status: this is not a transition. Keep the moment it became true.
+			//
+			// The IsZero guard matters — a stored condition whose lastTransitionTime failed to
+			// parse, or was never set, must NOT have that absence preserved. Carrying a zero
+			// timestamp forward would be the "plausible value" failure: it looks like a real
+			// instant (0001-01-01) rather than like missing data, and nothing downstream can
+			// tell the difference.
+			co.LastTransitionTime = el.LastTransitionTime
+		}
+		(*conds)[idx] = co
+		return
 	}
 	*conds = append(*conds, co)
 }
 
+// Join upserts every condition in all into conds.
+//
+// IT USED TO IGNORE `all` ENTIRELY: the body iterated *conds and upserted each element back into
+// itself, so it was a no-op with an unused parameter. Nothing in this module called it (control:
+// Upsert has 2 call sites), so the bug was invisible — but the function is EXPORTED, and the next
+// caller would have got silence rather than an error.
+//
+// Fixed rather than deleted: removing a published symbol breaks any consumer I cannot see, while
+// making it do what its name and signature already promise breaks nobody.
 func Join(conds *[]metav1.Condition, all []metav1.Condition) {
-	for _, el := range *conds {
+	for _, el := range all {
 		Upsert(conds, el)
 	}
 }
