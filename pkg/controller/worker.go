@@ -400,12 +400,34 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 		resourceExists, obsErr := c.externalResourceExists(ctx, el)
 
 		if obsErr != nil {
-			lg.Warn(errCreateIncomplete)
-			c.recordEvent(el, event.Warning(reasonCannotInitialize, actionProcessEvent, errors.New(errCreateIncomplete)))
+			// obsErr REACHES ALL THREE CHANNELS, and it did not used to.
+			//
+			// It was assigned and then referenced exactly once, in the test above — a grep for it
+			// returned two lines, the assignment and the `!= nil`. So every reason an existence
+			// check can fail collapsed into one fixed sentence, in the log, the event AND the
+			// condition. Found by the oasgen-provider session, read in source and confirmed here.
+			//
+			// WHY THAT IS WORSE THAN A MISSING %w. rest-dynamic-controller's Exists distinguishes
+			// EIGHT reasons it cannot answer, each implying a different operator action:
+			// observation delegated to a RESTAction, an async operation still in flight, a Pending
+			// condition, a kind declaring no read verb, unresolved path parameters, a synthesised
+			// 404 (a list that succeeded and matched nothing), a transport/5xx failure, and a
+			// client-build failure. All eight arrived as errCreateIncomplete.
+			//
+			// And errCreateIncomplete's own remediation is "remove the annotation if it is safe to
+			// proceed" — while the reason that would let anyone judge "if it is safe" was the thing
+			// being discarded. This branch deliberately refuses to proceed so it can never leak a
+			// resource; the refusal is right, and it was silent about why.
+			//
+			// The condition matters most of the three: charts and gates read a CR condition, not
+			// our logs. It keeps the existing remediation advice and adds the cause.
+			wrapped := fmt.Errorf("%s: %w", errCreateIncomplete, obsErr)
+			lg.Warn(errCreateIncomplete, "error", obsErr.Error())
+			c.recordEvent(el, event.Warning(reasonCannotInitialize, actionProcessEvent, wrapped))
 
 			err = unstructuredtools.SetConditions(el,
 				condition.Creating(),
-				condition.ReconcileError(errors.New(errCreateIncomplete)),
+				condition.ReconcileError(wrapped),
 			)
 			if err != nil {
 				lg.Error(err, "Cannot set condition")
