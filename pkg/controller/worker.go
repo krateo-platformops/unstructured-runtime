@@ -654,7 +654,37 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 		}
 	}
 
+	// THE HANDLER'S CONDITIONS MUST SURVIVE BOTH EARLY RETURNS (core-provider#241).
+	//
+	// They were applied to `el` above and then thrown away on either branch below, because the only
+	// status write in this function lives in the final `else`. A handler that returned a condition
+	// alongside ResourceExists=false or ResourceUpToDate=false had it set on an in-memory object
+	// that was never persisted — so the API we offer ("return conditions and we will record them")
+	// held on exactly one of three paths.
+	//
+	// Written only when the handler actually returned something, so the paths that previously did
+	// no status write still do none. The write is PatchStatusConditions, which carries only
+	// status.conditions, so it cannot express the absence of a handler-owned sibling field (#33).
+	persistHandlerConditions := func() {
+		if len(observation.Conditions) == 0 {
+			return
+		}
+		updated, perr := tools.PatchStatusConditions(ctx, el, tools.UpdateOptions{
+			Pluralizer:    c.pluralizer,
+			DynamicClient: c.dynamicClient,
+		})
+		if perr != nil {
+			// Logged, not returned: failing the observe here would turn an unrecordable condition
+			// into a wedged resource, which is the shape the comment above this block warns about.
+			log.Error(perr, "Cannot persist the conditions returned by the external client")
+			c.recordEvent(el, event.Warning(reasonCannotUpdateManaged, actionUpdateManagedResource, perr))
+			return
+		}
+		el = updated
+	}
+
 	if !observation.ResourceExists {
+		persistHandlerConditions()
 		item := ctrlevent.Event{
 			EventType: ctrlevent.Create,
 			ObjectRef: objectref.ObjectRef{
@@ -671,6 +701,7 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 		}, item)
 		return nil
 	} else if !observation.ResourceUpToDate {
+		persistHandlerConditions()
 		item := ctrlevent.Event{
 			EventType: ctrlevent.Update,
 			ObjectRef: objectref.ObjectRef{
@@ -687,11 +718,26 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 		}, item)
 		return nil
 	} else {
-		err = unstructuredtools.SetConditions(el, condition.ReconcileSuccess())
-		if err != nil {
-			log.Error(err, "Cannot set condition")
-			c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))
-			return err
+		// DO NOT OVERRIDE A CONDITION THE HANDLER EXPLICITLY RETURNED (core-provider#241).
+		//
+		// ReconcileSuccess() is Synced=True. Stamping it unconditionally overwrote whatever the
+		// handler had just returned for Synced, which made one documented state unreachable: the
+		// cdc's GRACEFUL pause returns ResourceExists=true and ResourceUpToDate=true, so it lands
+		// here, and any Synced it set was replaced on the same reconcile. The annotation pause
+		// escapes only by returning earlier (ReconcilePaused at the top of processItem) — so two
+		// pause mechanisms had inconsistent condition shapes for no reason anyone chose.
+		//
+		// "Up to date" is the runtime's conclusion from ResourceUpToDate, and it is right by
+		// default. But a handler that returns a Synced condition is making a MORE specific
+		// statement about its own convergence, and the specific statement wins. The runtime's
+		// default is a default, not an override.
+		if !hasConditionType(observation.Conditions, condition.TypeSynced) {
+			err = unstructuredtools.SetConditions(el, condition.ReconcileSuccess())
+			if err != nil {
+				log.Error(err, "Cannot set condition")
+				c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))
+				return err
+			}
 		}
 		el, err = tools.PatchStatusConditions(ctx, el, tools.UpdateOptions{
 			Pluralizer:    c.pluralizer,
@@ -1092,4 +1138,19 @@ func (c *Controller) recordEvent(obj runtime.Object, e event.Event) {
 	}
 
 	c.throttledRecorder.Event(obj, e)
+}
+
+// hasConditionType reports whether conds contains a condition of type t.
+//
+// Used to decide whether the runtime's default Synced stamp would OVERRIDE a statement the handler
+// already made (core-provider#241). Keyed on the TYPE, not on reason or status: the question is
+// "has the handler spoken about this condition", and any answer it gave is more specific than the
+// runtime's default.
+func hasConditionType(conds []metav1.Condition, t string) bool {
+	for _, c := range conds {
+		if c.Type == t {
+			return true
+		}
+	}
+	return false
 }
