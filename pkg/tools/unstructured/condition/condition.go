@@ -1,7 +1,9 @@
 package condition
 
 import (
+	"fmt"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"time"
 )
 
 // Condition types.
@@ -59,6 +61,28 @@ const (
 	ReasonReconcileSuccess string = "ReconcileSuccess"
 	ReasonReconcileError   string = "ReconcileError"
 	ReasonReconcilePaused  string = "ReconcilePaused"
+
+	// ReasonReconcileDeferred: the runtime CHOSE NOT TO CALL the handler this pass, because a
+	// server expressed a rate limit for this object's endpoint. Nothing about the resource was
+	// learned, so this is not an assessment — and it is not silence either.
+	//
+	// WHY NOT ObserveFailed OR ReconcileError. Those mean "we looked and it went badly". The
+	// handler did not run, so either would be a false statement about state. And writing NOTHING
+	// would be worse in a quieter way: a deferral that records nothing is indistinguishable from a
+	// pass that ran and found everything fine, so on a long backoff the conditions go stale while
+	// reporting healthy. core-provider hit that shape three separate times (#273, #331, #337).
+	//
+	// THE MESSAGE CARRIES THE DEADLINE, and that is not decoration. "Deferred" with no deadline
+	// becomes a lie purely through elapsed time, which is the most common way a status field stops
+	// being true without anything changing.
+	//
+	// THE STRING IS A CONSUMER CONTRACT and it is DISTINCT from every other reason here on
+	// purpose. This package already carries a collision — ReasonReconcilePausedReady and
+	// ReasonReconcilePaused are two identifiers with the single value "ReconcilePaused", so a
+	// consumer reading a reason cannot tell Ready-paused from Synced-paused and only the condition
+	// TYPE discriminates. That cost a wrong answer between two sessions on 2026-11-04. A new reason
+	// must not add a second instance; see TestReconcileDeferredReasonIsDistinct.
+	ReasonReconcileDeferred string = "ReconcileDeferred"
 )
 
 func Unavailable() metav1.Condition {
@@ -311,6 +335,37 @@ func ReconcileError(err error) metav1.Condition {
 		LastTransitionTime: metav1.Now(),
 		Reason:             ReasonReconcileError,
 		Message:            err.Error(),
+	}
+}
+
+// ReconcileDeferred returns the Synced condition for a pass the runtime chose not to make, because
+// key's endpoint expressed a rate limit.
+//
+// Synced=False is correct and load-bearing: nothing is converging this object right now, which is
+// the same semantic as the pause conditions — so a dependency gate that requires Synced=True
+// already handles deferral with no change on its side.
+//
+// READY IS NOT TOUCHED by this helper, and callers must not touch it either. Readiness is the
+// handler's finding and the handler did not run; overwriting it would repeat #45, where
+// ObserveFailed overwrote a handler's own finding.
+//
+// until may be the zero time, which means "we are holding this back ourselves and nobody gave us a
+// deadline". The message then says so rather than inventing one — a deadline we made up is read by
+// a consumer as the server's.
+func ReconcileDeferred(key string, until time.Time) metav1.Condition {
+	msg := fmt.Sprintf("reconciliation deferred: %s is rate-limited", key)
+	if !until.IsZero() {
+		msg = fmt.Sprintf("reconciliation deferred: %s is rate-limited by the server; next attempt %s",
+			key, until.UTC().Format(time.RFC3339))
+	} else {
+		msg += " and the runtime is holding below its own ceiling; no server deadline was given"
+	}
+	return metav1.Condition{
+		Type:               TypeSynced,
+		Status:             metav1.ConditionFalse,
+		LastTransitionTime: metav1.Now(),
+		Reason:             ReasonReconcileDeferred,
+		Message:            msg,
 	}
 }
 
