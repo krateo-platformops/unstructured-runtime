@@ -24,6 +24,12 @@ const (
 	// ReasonZeroEvidence: readiness could not be assessed AT ALL — every signal the controller
 	// knows how to read was absent, not negative. See ZeroEvidence.
 	ReasonZeroEvidence string = "ZeroEvidence"
+
+	// ReasonObserveFailed: the observation itself did not complete, so nothing assessed this
+	// resource's health. Sibling in meaning to ZeroEvidence — both mean "we do not know" — but
+	// distinct in cause: ZeroEvidence is "we looked and found nothing to read", ObserveFailed is
+	// "we could not look".
+	ReasonObserveFailed string = "ObserveFailed"
 	// ReasonReconcilePausedReady: Ready is being reported for a resource whose reconciliation is
 	// PAUSED, so the value is the last one observed and is not being refreshed. Status stays True —
 	// a paused resource is still available, it just is not converging (core-provider#241).
@@ -104,6 +110,40 @@ func ReadyPaused() metav1.Condition {
 func WithMessage(c metav1.Condition, message string) metav1.Condition {
 	c.Message = message
 	return c
+}
+
+// ObserveFailed is the READINESS half of a failed observation: Ready=UNKNOWN.
+//
+// Before this, an Observe failure wrote Synced=ReconcileError and NOTHING to Ready, so Ready kept
+// whatever it last held — including True/Available. A CR then reported ready for a resource nobody
+// had successfully observed, indefinitely, for as long as the observation kept failing. That is a
+// correct value that stopped being refreshed, which from outside is indistinguishable from a
+// healthy one.
+//
+// UNKNOWN, NOT FALSE, and the distinction is the whole point. We did not observe the resource
+// becoming unhealthy — we failed to observe it at all. False would report an outage of the resource
+// when the outage is in our ability to look, and it would move every readiness-gating consumer on
+// what may be a transient apiserver blip. Unknown says the true thing: nobody knows.
+//
+// WHY ObserveFailed AND NOT NotObserved, which provider-runtime uses for the same situation in its
+// own (entirely separate) runtime: oasgen-provider already publishes an `Observed` condition whose
+// False reason is NoResponseBody, meaning "the observe SUCCEEDED and returned no body". Two
+// conditions about observation whose names agree and whose meanings do not would be read as one
+// claim, and the narrower one would be lost. ObserveFailed names the failure — "we tried and could
+// not" — which composes with "we succeeded and got nothing" instead of colliding with it.
+//
+// CONTRACT FOR CALLERS: write this BESIDE Synced=ReconcileError, never instead of it. Consumers
+// read Synced's reason to decide whether the last reconcile errored (oasgen's lastReconcileErrored
+// feeds their not-exists branch); dropping it would remove a guard that currently fires for exactly
+// this condition. The two conditions are not redundant — they answer different questions.
+func ObserveFailed(message string) metav1.Condition {
+	return metav1.Condition{
+		Type:               TypeReady,
+		Status:             metav1.ConditionUnknown,
+		LastTransitionTime: metav1.Now(),
+		Reason:             ReasonObserveFailed,
+		Message:            message,
+	}
 }
 
 func FailWithReason(reason string) metav1.Condition {
