@@ -628,9 +628,35 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 		// land. Ready legitimately keeps its value, and Synced=ReconcileError is the whole story.
 		// An observation failure invalidates our knowledge of health; a failed update does not.
 		wrapped := errors.Wrap(actionErr, errReconcileObserve)
-		err = unstructuredtools.SetConditions(e,
-			condition.ObserveFailed(wrapped.Error()),
-			condition.ReconcileError(wrapped))
+
+		// WHICH Ready to write, and the two cases where ObserveFailed is the WRONG answer.
+		//
+		// 1. THE HANDLER ALREADY ASSESSED IT. A handler may write a Ready FINDING and then return
+		//    its error — core-provider's cdc does exactly that on two paths, with the diagnostic
+		//    in the message. Overwriting that with "could not observe" replaces a finding with an
+		//    absence of finding, which is worse information in the one direction an operator
+		//    cannot recover from. ReadyAssessed is how a handler says so; a before/after snapshot
+		//    cannot tell, because the handler's write is often the SAME value as what was there.
+		//
+		// 2. THE OBJECT IS BEING DELETED. handleObserve has no deletion guard — the Create branch
+		//    drops deleted objects explicitly, this path does not — so a composition with a
+		//    deletion timestamp reaches here. "Nobody knows" is false about an object whose fate is
+		//    certain, and Deleting is what every other deletion path on this object reports.
+		//
+		// Synced=ReconcileError is written in ALL cases: consumers read its reason to decide
+		// whether the last reconcile errored, and that guard must not depend on which Ready we
+		// chose.
+		readyCond := condition.ObserveFailed(wrapped.Error())
+		switch {
+		case IsReadyAssessed(actionErr):
+			// The handler owns Ready for this call. Write only Synced.
+			err = unstructuredtools.SetConditions(e, condition.ReconcileError(wrapped))
+		default:
+			if meta.WasDeleted(e) {
+				readyCond = condition.Deleting()
+			}
+			err = unstructuredtools.SetConditions(e, readyCond, condition.ReconcileError(wrapped))
+		}
 		if err != nil {
 			log.Error(err, "Cannot set condition")
 			c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))
