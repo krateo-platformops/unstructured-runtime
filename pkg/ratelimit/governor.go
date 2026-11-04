@@ -1,7 +1,8 @@
 package ratelimit
 
 import (
-	"math/rand"
+	cryptorand "crypto/rand"
+	"encoding/binary"
 	"sync"
 	"time"
 )
@@ -77,12 +78,7 @@ func New(o Options) Governor {
 		o.Now = time.Now
 	}
 	if o.Jitter == nil {
-		o.Jitter = func(d time.Duration) time.Duration {
-			if d <= 0 {
-				return 0
-			}
-			return d/2 + time.Duration(rand.Int63n(int64(d)))
-		}
+		o.Jitter = jitter
 	}
 	return &aimd{keys: map[string]*keyState{}, opts: o}
 }
@@ -192,6 +188,29 @@ func (g *aimd) Capacity(key string) int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.state(key).capacity
+}
+
+// jitter returns a delay uniformly in [d/2, 3d/2).
+//
+// crypto/rand RATHER THAN math/rand, and not because jitter is security-sensitive — it is not. gosec
+// flags math/rand and math/rand/v2 alike (G404), and the two ways to make the check pass are a
+// `#nosec` suppression or a source that genuinely satisfies it. A suppression is an exception every
+// later reviewer has to re-justify, and it silences the scanner for the whole line rather than for
+// the reason given. crypto/rand costs eight bytes per deferral, which is nothing next to the
+// round-trip it is delaying.
+//
+// On a read failure it returns d — the full delay, never a shorter one. Failing short is the
+// dangerous direction for a backoff: it is how a client comes back early, and early is how it gets
+// banned rather than throttled.
+func jitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	var b [8]byte
+	if _, err := cryptorand.Read(b[:]); err != nil {
+		return d
+	}
+	return d/2 + time.Duration(binary.LittleEndian.Uint64(b[:])%uint64(d))
 }
 
 // RequeueAfter is how long a caller should wait before retrying a deferred item.
