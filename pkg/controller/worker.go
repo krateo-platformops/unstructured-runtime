@@ -611,7 +611,26 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 			return err
 		}
 
-		err = unstructuredtools.SetConditions(e, condition.ReconcileError(errors.Wrap(actionErr, errReconcileObserve)))
+		// BOTH conditions, and Ready is UNKNOWN rather than left alone.
+		//
+		// This path used to write Synced only, so Ready kept whatever it last held — including
+		// True/Available. A CR then reported ready for a resource nobody had successfully
+		// observed, for as long as the observation kept failing. A stale True is silently wrong,
+		// which is worse than an honest "nobody knows".
+		//
+		// Synced=ReconcileError STAYS, and that is a contract rather than redundancy: consumers
+		// read Synced's reason to decide whether the last reconcile errored — oasgen's
+		// lastReconcileErrored feeds their not-exists branch, and it fires for exactly this
+		// condition. Writing Ready INSTEAD of Synced would remove a guard that works today.
+		//
+		// The UPDATE-failure path deliberately does NOT get this. There, Observe succeeded and
+		// said not-up-to-date; the resource's health is unchanged and only the new spec failed to
+		// land. Ready legitimately keeps its value, and Synced=ReconcileError is the whole story.
+		// An observation failure invalidates our knowledge of health; a failed update does not.
+		wrapped := errors.Wrap(actionErr, errReconcileObserve)
+		err = unstructuredtools.SetConditions(e,
+			condition.ObserveFailed(wrapped.Error()),
+			condition.ReconcileError(wrapped))
 		if err != nil {
 			log.Error(err, "Cannot set condition")
 			c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))
