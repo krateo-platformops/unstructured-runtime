@@ -82,6 +82,30 @@ func ReadyPaused() metav1.Condition {
 	}
 }
 
+// WithMessage returns c with its Message set, leaving Type, Status and Reason untouched.
+//
+// WHY A MESSAGE ON Ready AT ALL. The runtime's failure paths write Ready (Creating/Deleting) beside
+// Synced=ReconcileError. Synced carried the whole diagnostic and Ready carried an EMPTY message, so
+// a reader who stopped at Ready — and Ready is the condition people watch, the one
+// `kubectl wait --for=condition=Ready` names — saw `reason=Creating` and concluded "still working"
+// about a create that would never succeed. Measured by the oasgen-provider session on 0.50.0: a
+// ComputeFlavor wedged on a refused cross-host redirect, retrying forever, with the refused host
+// and the permitted set stated in full on Synced and nowhere on Ready.
+//
+// WHY THE REASON MUST NOT CHANGE INSTEAD, which is the obvious alternative. IsConditionSet compares
+// Type && Status && Reason (unstructured.go:274), and consumers use it as a LATCH GUARD —
+// oasgen's restResources.go reads IsConditionSet(mg, condition.Creating()) for exactly that.
+// Changing the reason breaks the guard and reintroduces their #347: a create rejected 422 left
+// Creating set, a later branch read its absence as grounds to assume the resource was fine, set
+// Available, and latched a CR permanently Ready=True for a resource that was never created. A
+// silently-wrong Ready=True is worse than a confusing Ready=False.
+//
+// Message is NOT compared, so attaching one is free on that axis. The obstacle was never the field.
+func WithMessage(c metav1.Condition, message string) metav1.Condition {
+	c.Message = message
+	return c
+}
+
 func FailWithReason(reason string) metav1.Condition {
 	return metav1.Condition{
 		Type:               TypeReady,
