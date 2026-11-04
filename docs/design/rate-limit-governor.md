@@ -359,8 +359,14 @@ without writing the condition; write `ObserveFailed` instead of `ReconcileDeferr
    - plumbing is already a release-cadence choke point. core-provider and the cdc sit on v1.21.0
      while chart-inspector is on v1.23.0, so a vocabulary change would need a plumbing release plus
      two bumps before either runtime could move.
-   - provider-runtime does not depend on plumbing today, and a new dependency edge to share a struct
-     and a string is a lot of coupling for a little duplication.
+   - the coupling is **release cadence, not a new dependency edge.** An earlier version of this
+     reasoning said provider-runtime does not depend on plumbing; it does — `go.mod` line 10,
+     `github.com/krateo-platformops/plumbing v1.13.0`, verified in its repository after the
+     provider-runtime session corrected me. I asserted a fact about another repo that was one file
+     read away. The decision is unchanged and one of its three reasons was wrong: sharing would not
+     add an edge, it would make a vocabulary change need a plumbing release and two bumps — and
+     v1.13.0 against this repo's consumers on v1.21.0/v1.23.0 shows those bumps do not happen
+     together.
    - **the compiler would not enforce the thing that matters.** A shared type guarantees the field
      names agree; it does not guarantee both runtimes interpret `Throttled` or `ResetAt` the same
      way, which is the divergence that would actually confuse an operator. That needs a test either
