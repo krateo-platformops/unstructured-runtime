@@ -19,5 +19,60 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
 
+  # A FORMATTING AND TIDINESS GATE, which this repo did not have.
+  #
+  # Three files on main were not gofmt-clean when this was added — pkg/controller/builder/builder.go,
+  # pkg/controller/priorityqueue/drain_test.go and pkg/meta/meta_test.go — so a repo-wide
+  # `gofmt -w .` during an unrelated fix produced a 19-line reformat that had to be reverted out of
+  # the diff by hand. Drift is cheap to prevent and expensive to untangle from a behaviour change.
+  #
+  # core-provider has this gate and it caught two real regressions in one afternoon: a formatting
+  # slip, and a `go mod tidy` drift left by removing an import. Neither was visible locally.
+  static-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      # EVERY FAILURE MODE OF THIS CHECK EXITS 0 AND READS AS A PASS unless the denominator is
+      # printed: a glob that matched nothing, a `find` rooted in the wrong place, and a clean tree
+      # are indistinguishable from each other by exit code alone. So the count of files examined is
+      # asserted non-zero BEFORE the result is believed.
+      - name: gofmt
+        run: |
+          set -uo pipefail
+          examined=$(find . -name '*.go' -not -path './vendor/*' | grep -c . || true)
+          if [ "$examined" -eq 0 ]; then
+            echo "::error::gofmt examined 0 .go files. A check that inspects nothing passes for the wrong reason." >&2
+            exit 1
+          fi
+          unformatted=$(gofmt -l . | grep -v '^vendor/' || true)
+          if [ -n "$unformatted" ]; then
+            echo "$unformatted"
+            echo "::error::gofmt would rewrite the files above. Run 'gofmt -w .' until 'gofmt -l .' prints nothing (doc comments can need two passes), then commit." >&2
+            exit 1
+          fi
+          echo "gofmt: clean ($examined .go files examined)"
+
+      # go.mod/go.sum drift, which is how removing one import strands a dependency. Separated from
+      # gofmt so the error says which of the two failed rather than "static analysis".
+      - name: go mod tidy is a no-op
+        run: |
+          set -uo pipefail
+          cp go.mod /tmp/go.mod.before
+          cp go.sum /tmp/go.sum.before
+          if ! go mod tidy; then
+            echo "::error::'go mod tidy' itself failed; the module cannot be resolved." >&2
+            exit 1
+          fi
+          if ! diff -q /tmp/go.mod.before go.mod >/dev/null || ! diff -q /tmp/go.sum.before go.sum >/dev/null; then
+            diff -u /tmp/go.mod.before go.mod || true
+            echo "::error::go.mod/go.sum are not tidy. Run 'go mod tidy' and commit the result." >&2
+            exit 1
+          fi
+          echo "go mod tidy: no-op"
+
   lint-docs:
     uses: krateo-platformops/.github/.github/workflows/lint-docs.yaml@main
