@@ -23,6 +23,24 @@ const (
 	ReasonInstalled   string = "Installed"
 	// ReasonZeroEvidence: readiness could not be assessed AT ALL — every signal the controller
 	// knows how to read was absent, not negative. See ZeroEvidence.
+	// THE STRING IS A CONSUMER CONTRACT, not an internal label. Renaming it is a BREAKING CHANGE
+	// for at least two gates that match it exactly and fail closed on anything else:
+	//
+	//   krateo-platformops/installer  chart/templates/_helpers.tpl:299
+	//     inst.readyFromConditions accepts Ready=True, OR Unknown with reason EXACTLY
+	//     "ZeroEvidence", with a strict else. A different Unknown reason is read as not-ready and
+	//     inst.depsReady holds back every dependent.
+	//   krateo-platformops/installer  hack/ready-classify.sh:25-31
+	//     same acceptance, same strict else.
+	//
+	// Failing closed is the behaviour those gates want — a converging child also reports Unknown
+	// and MUST block. The consequence is that this string cannot be changed unilaterally: a rename
+	// turns every zero-evidence composition into a blocked dependency chain, silently, until
+	// someone notices dependents never appeared.
+	//
+	// So: if this is ever renamed, the installer gates change in the same change, and the installer
+	// session gets told before it ships. Recorded at their request after they confirmed both call
+	// sites.
 	ReasonZeroEvidence string = "ZeroEvidence"
 
 	// ReasonObserveFailed: the observation itself did not complete, so nothing assessed this
