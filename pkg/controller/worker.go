@@ -593,6 +593,31 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 		return err
 	}
 
+	// ONE DELETION DECISION PER PASS (#47), captured from this function's own and only read of the
+	// object before anything can change underneath it.
+	//
+	// The error path below takes a SECOND fetch — deliberately, and it stays: it is the write
+	// target for the conditions, and `el` has been handed to a handler by then, so writing onto it
+	// risks a stale resourceVersion. The defect was never "two reads". It was that a DECISION and
+	// a WRITE TARGET are different uses of an object: re-fetching to write is right, and
+	// re-fetching and then DECIDING from the new object — when the dispatch above was chosen from
+	// the old one — is the bug. A deletion timestamp landing between the two made the pass
+	// internally inconsistent, with nothing to reconcile the halves.
+	//
+	// The invariant is provider-runtime's, which does not have this shape: it reads once
+	// (pkg/reconciler/reconciler.go:775) and takes every deletion decision from that copy, so a
+	// timestamp arriving mid-reconcile surfaces as a resourceVersion conflict on the status write,
+	// requeues, and the next pass sees it consistently. "Read once" does not transfer here because
+	// the write needs a fresh object; "every deletion decision in one pass comes from one object"
+	// does.
+	//
+	// STILL OPEN, and narrower than this fix: processItem takes its own earlier read and dispatches
+	// to this function on it, so a deletion landing between THAT read and this one leaves the same
+	// kind of disagreement one level up. Closing it means passing the fact down rather than
+	// re-deriving it, which changes this function's signature and seven call sites — recorded on
+	// #47 rather than folded in here.
+	deletedAtEntry := meta.WasDeleted(el)
+
 	start := time.Now()
 	observation, actionErr := c.externalClient.Observe(ctx, el)
 	if c.metrics != nil {
@@ -652,22 +677,26 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 			// The handler owns Ready for this call. Write only Synced.
 			err = unstructuredtools.SetConditions(e, condition.ReconcileError(wrapped))
 		default:
-			// EITHER a deletion timestamp OR a Ready that already reads Deleting. provider-runtime
-			// tests both (pkg/reconciler/ready.go:64, `meta.WasDeleted(mg) || Reason ==
-			// ReasonDeleting`) and this tested only the first, which was an asymmetry rather than a
-			// decision — found by the provider-runtime and oasgen-provider sessions reading the
-			// tagged code side by side.
+			// ONE DELETION DECISION PER PASS (#47/#48), made STICKY (#46). Two fixes to the same
+			// defect, combined rather than chosen between:
 			//
-			// The second disjunct matters because `e` is a FRESH RE-FETCH (see fetch, above), so a
-			// timestamp that has not yet landed in the copy we read loses the Deleting the previous
-			// reconcile correctly wrote, and replaces it with ObserveFailed. provider-runtime's own
-			// reasoning for writing it is the reason to keep it sticky: Deleting is true whatever
-			// the external system answers, so the runtime writes it rather than relying on every
-			// handler to set it before erroring on its deletion path.
+			//   deletedAtEntry   the decision taken ONCE, from the queue entry, at the top of this
+			//                    pass. This replaces meta.WasDeleted(e): `e` is a fresh RE-FETCH of a
+			//                    different object than the one the pass began with, and deciding
+			//                    twice from two copies is how the two decisions came to disagree.
+			//   Ready=Deleting   kept from #46. A timestamp that has not yet landed can be missing
+			//                    from EITHER copy, so neither read alone is safe. A previous pass that
+			//                    already concluded Deleting wrote it to Ready, and that is a durable
+			//                    record independent of which copy this pass happened to read.
+			//                    provider-runtime tests the same pair (pkg/reconciler/ready.go:64).
+			//
+			// The two are consistent rather than a second decision in disguise: a deletion timestamp
+			// is permanent once set, so Ready=Deleting with deletedAtEntry false can only mean the
+			// ENTRY is stale — exactly the case the sticky disjunct exists for.
 			//
 			// Keyed on the REASON and not on a non-True Ready: a converging object also reports a
 			// non-True Ready and must not be mistaken for a deleting one.
-			deleting := meta.WasDeleted(e) ||
+			deleting := deletedAtEntry ||
 				unstructuredtools.GetCondition(e, condition.TypeReady, condition.ReasonDeleting) != nil
 			if deleting {
 				readyCond = condition.Deleting()
