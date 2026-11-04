@@ -542,8 +542,8 @@ func TestExternalCreatePendingDuring(t *testing.T) {
 		want bool
 	}{
 		"NoPendingMarker":   {mk(0, false), time.Minute, false},
-		"PendingWithin":     {mk(30 * time.Second, true), time.Minute, true},
-		"PendingTooLongAgo": {mk(2 * time.Minute, true), time.Minute, false},
+		"PendingWithin":     {mk(30*time.Second, true), time.Minute, true},
+		"PendingTooLongAgo": {mk(2*time.Minute, true), time.Minute, false},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
