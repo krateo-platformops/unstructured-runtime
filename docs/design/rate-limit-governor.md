@@ -1,3 +1,12 @@
+---
+type: Architecture
+title: unstructured-runtime — automatic reconcile slow-down under server-side rate limits
+description: Design for a per-endpoint governor that slows reconciliation when GitHub Enterprise, Azure DevOps or any server expresses a rate limit, replacing hand-tuned worker counts and resync intervals.
+resource: github.com/krateo-platformops/unstructured-runtime
+tags: [rate-limit, governor, backoff, deferral, conditions]
+timestamp: 2026-11-05T00:00:00Z
+---
+
 # Automatic reconcile slow-down under server-side rate limits
 
 **Status:** design, not implemented. Revised once after review by the provider-runtime session,
