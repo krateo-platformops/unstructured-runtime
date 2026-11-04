@@ -45,13 +45,13 @@ func TestShutDown_NoWedge_WhenSpinMidHandoff(t *testing.T) {
 
 		go func() { _, _, _ = q.GetWithPriority() }() // park a waiter
 		time.Sleep(50 * time.Microsecond)             // let it park so spin will attempt a hand-out
-		q.Add(i)                                       // spin picks the item and attempts the send
-		q.ShutDown()                                   // race: close(w.done) vs spin's send
+		q.Add(i)                                      // spin picks the item and attempts the send
+		q.ShutDown()                                  // race: close(w.done) vs spin's send
 
 		done := make(chan struct{})
 		go func() {
-			_ = q.Len()  // needs w.lock
-			q.Done(i)    // needs w.lockedLock
+			_ = q.Len() // needs w.lock
+			q.Done(i)   // needs w.lockedLock
 			close(done)
 		}()
 		select {
