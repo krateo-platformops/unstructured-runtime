@@ -1,6 +1,7 @@
 # Automatic reconcile slow-down under server-side rate limits
 
-**Status:** design, not implemented.
+**Status:** design, not implemented. Revised once after review by the provider-runtime session,
+which found a circular dependency and a self-contradiction in the first draft (§3).
 **Owner:** unstructured-runtime.
 **Motivation:** server-side rate limiting on GitHub Enterprise and Azure DevOps currently has to be
 absorbed by hand — operators tune worker counts and resync intervals per installation, per provider,
@@ -115,21 +116,71 @@ assertion that cannot see inside them.
 ```go
 // Governor decides how much concurrency a key currently gets, and how long to defer.
 type Governor interface {
-	// Acquire blocks until this key may make a call, or the context is done. It returns a release
-	// func and, when the caller should not proceed at all, a deferral.
-	Acquire(ctx context.Context, key string) (release func(), defer_ *Deferral, err error)
+	// TryAcquire NEVER BLOCKS. It either grants capacity (returning a release func) or returns a
+	// Deferral saying why and when to come back. See "why non-blocking" below — a blocking
+	// acquire makes this design contradict itself.
+	TryAcquire(key string) (release func(), d *Deferral)
 	Observe(Signal)
 }
 
 type Deferral struct {
-	Key      string
-	Until    time.Time
-	Reason   string
+	Key    string
+	Reason DeferReason
+	// Until is the server's OWN deadline, and is set only when we have one. When the key is merely
+	// at capacity it stays ZERO and the caller requeues with a short jittered delay instead — a
+	// deadline we invented is a deadline a consumer reads as the server's.
+	Until time.Time
+}
+
+type DeferReason string
+
+const (
+	// DeferThrottled: the server refused or told us to wait. Until is set.
+	DeferThrottled DeferReason = "Throttled"
+	// DeferAtCapacity: the governor is holding us below its own ceiling. Until is ZERO.
+	DeferAtCapacity DeferReason = "AtCapacity"
+)
+
+// RateLimitKeyer lets a handler name the scope BEFORE a call is made. Optional: a handler that
+// does not implement it is never gated.
+//
+// THIS CLOSES A CIRCULAR DEPENDENCY in the first draft of this design, found by the
+// provider-runtime session. TryAcquire needs the key before the call; the key arrives in the Signal
+// reported DURING the call. Both halves were written and neither could be satisfied.
+//
+// It must do NO I/O — it runs before every gated call, and a keyer that made a request to decide
+// whether a request is allowed would be its own rate-limit problem.
+//
+// Learning keys from past signals was the alternative and is worse: every object's first call would
+// be ungated, and an object that changes endpoint would be gated against the wrong key until it
+// next failed.
+type RateLimitKeyer interface {
+	RateLimitKey(mg *unstructured.Unstructured) (string, error)
 }
 ```
 
-Each worker calls `Acquire` immediately before `externalClient.Observe` (and the other verbs) and
-releases after. The gate is a **resizable semaphore**, so effective parallelism changes at runtime
+### Why non-blocking, and why the first draft was self-contradictory
+
+The first version of this section had `Acquire` *block* until the key had capacity. That is wrong,
+and wrong in a way this document already argued against two sections later:
+
+> §5: key by endpoint, **not globally**, because a GitHub Enterprise limit must not slow Azure
+> DevOps reconciles.
+
+With a fixed worker pool and a blocking acquire, every worker can park on one throttled key — and
+then nothing processes the healthy keys either. The blocking gate reproduces exactly the global
+stall that keying exists to prevent. The design contradicted itself and I did not notice; the
+provider-runtime session did.
+
+So `TryAcquire` returns immediately, and the worker requeues:
+
+```
+DeferThrottled   -> AddAfter(item, until)            the server's deadline
+DeferAtCapacity  -> AddAfter(item, jitter(200ms..2s)) no deadline claimed
+```
+
+Each worker resolves the key with `RateLimitKeyer` and calls `TryAcquire` immediately before
+`externalClient.Observe` (and the other verbs), releasing after. The gate is a **resizable semaphore**, so effective parallelism changes at runtime
 without restarting anything — which is what replaces the manual worker tuning. `Run(ctx, numWorkers)`
 keeps its signature and its goroutine count; what changes is how many of them may be *in a handler
 call* at once.
@@ -300,7 +351,26 @@ without writing the condition; write `ObserveFailed` instead of `ReconcileDeferr
 2. **Per-verb keying.** Observe is read-only and cheap; Create/Update are not. A quota expressed in
    cost units (Azure's TSTUs) is not evenly consumed across verbs. Proposal: ignore for v1 and
    revisit with real numbers, because guessing the weights is worse than not weighting.
-3. **Should the deferral condition be `Synced=False` or a new typed condition?** `Synced=False`
+3. **Should `Signal` and the reason string live in a shared module imported by both runtimes?**
+   **Answered: no — duplicated declarations with a contract test in each repo.** Asked by the
+   provider-runtime session; decided as plumbing's owner, and the reasons are specific rather than
+   a general preference for duplication:
+
+   - plumbing is already a release-cadence choke point. core-provider and the cdc sit on v1.21.0
+     while chart-inspector is on v1.23.0, so a vocabulary change would need a plumbing release plus
+     two bumps before either runtime could move.
+   - provider-runtime does not depend on plumbing today, and a new dependency edge to share a struct
+     and a string is a lot of coupling for a little duplication.
+   - **the compiler would not enforce the thing that matters.** A shared type guarantees the field
+     names agree; it does not guarantee both runtimes interpret `Throttled` or `ResetAt` the same
+     way, which is the divergence that would actually confuse an operator. That needs a test either
+     way.
+
+   So: a contract test per repo pinning the literal and naming the other runtime as a consumer, in
+   the shape `ReasonZeroEvidence` already documents here. If the two are ever changed in lockstep
+   more than once, that is the evidence for a shared module.
+
+4. **Should the deferral condition be `Synced=False` or a new typed condition?** `Synced=False`
    reuses an existing contract and gets dependency gates for free. A typed `ReconcileDeferred`
    condition is more precise and is a new thing for every consumer to learn. Proposal: `Synced=False`,
    on the same reasoning that made the graceful pause adopt the runtime's existing shape rather than
