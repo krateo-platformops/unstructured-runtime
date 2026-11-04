@@ -227,7 +227,30 @@ func (c *Controller) runWorker(ctx context.Context) {
 		)
 
 		c.items.Delete(dig)
-		c.queue.Forget(ev)
+		// FORGET ON SUCCESS ONLY (#51). Forget is how a limiter is told "this item recovered"; it
+		// deletes the item's failure record. Calling it unconditionally told the limiter that EVERY
+		// item was healthy, including the one that had just failed, and handleErr reads
+		// NumRequeues immediately afterwards:
+		//
+		//	NumRequeues(obj) >= maxRetries   was 0 >= maxRetries on every pass, never true,
+		//	                                 so the drop NEVER fired and an unprocessable event
+		//	                                 was retried forever with maxRetries configured and
+		//	                                 silently ignored
+		//	When(obj)                        also saw a zero count, so the builder default's
+		//	                                 exponential never climbed past its 3s base
+		//
+		// Both of this repo's in-house consumers were immune by accident rather than design: the
+		// cdc and rest-dynamic-controller override with NewExponentialTimedFailureRateLimiter,
+		// whose Forget only deletes after 2*maxDelay of idleness, so an unconditional Forget right
+		// after processing is a no-op for an actively-retrying item. Anything on the builder
+		// default was affected.
+		//
+		// NOT MOVED AFTER handleErr, which is the fix that looks complete and is not: the
+		// NumRequeues check would then be correct while the count was still wiped afterwards, so
+		// the NEXT pass would start from zero and the backoff half would stay broken.
+		if err == nil {
+			c.queue.Forget(ev)
+		}
 		c.queue.Done(ev)
 		c.handleErr(err, ev, priority)
 		if c.metrics != nil {
