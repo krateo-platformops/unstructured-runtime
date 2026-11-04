@@ -652,7 +652,24 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 			// The handler owns Ready for this call. Write only Synced.
 			err = unstructuredtools.SetConditions(e, condition.ReconcileError(wrapped))
 		default:
-			if meta.WasDeleted(e) {
+			// EITHER a deletion timestamp OR a Ready that already reads Deleting. provider-runtime
+			// tests both (pkg/reconciler/ready.go:64, `meta.WasDeleted(mg) || Reason ==
+			// ReasonDeleting`) and this tested only the first, which was an asymmetry rather than a
+			// decision — found by the provider-runtime and oasgen-provider sessions reading the
+			// tagged code side by side.
+			//
+			// The second disjunct matters because `e` is a FRESH RE-FETCH (see fetch, above), so a
+			// timestamp that has not yet landed in the copy we read loses the Deleting the previous
+			// reconcile correctly wrote, and replaces it with ObserveFailed. provider-runtime's own
+			// reasoning for writing it is the reason to keep it sticky: Deleting is true whatever
+			// the external system answers, so the runtime writes it rather than relying on every
+			// handler to set it before erroring on its deletion path.
+			//
+			// Keyed on the REASON and not on a non-True Ready: a converging object also reports a
+			// non-True Ready and must not be mistaken for a deleting one.
+			deleting := meta.WasDeleted(e) ||
+				unstructuredtools.GetCondition(e, condition.TypeReady, condition.ReasonDeleting) != nil
+			if deleting {
 				readyCond = condition.Deleting()
 			}
 			err = unstructuredtools.SetConditions(e, readyCond, condition.ReconcileError(wrapped))

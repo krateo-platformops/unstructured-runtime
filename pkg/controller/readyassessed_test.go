@@ -246,3 +246,61 @@ func TestHandleObserve_DeletedObjectGetsDeletingNotObserveFailed(t *testing.T) {
 	require.Equal(t, condition.ReasonReconcileError, syncedOf(t, updated).Reason,
 		"Synced must still carry the error on the deletion path too")
 }
+
+// THE SECOND HALF OF THE DISJUNCT: a Ready that ALREADY reads Deleting must survive an Observe
+// failure even when the object we re-read carries no deletion timestamp.
+//
+// provider-runtime tests `meta.WasDeleted(mg) || Reason == ReasonDeleting` (pkg/reconciler/
+// ready.go:64); this runtime tested only the first half, which was an asymmetry rather than a
+// decision — found by the provider-runtime and oasgen-provider sessions reading the tagged v1.7.6
+// code side by side.
+//
+// It matters because `e` is a FRESH RE-FETCH: the copy the failure path writes onto is read back
+// from the apiserver, so a deletion timestamp that has not yet landed in that read would lose the
+// Deleting a previous reconcile correctly wrote and replace it with ObserveFailed — a durable lie
+// about an object whose fate is certain. provider-runtime's own reason for writing Deleting is the
+// reason to keep it sticky: it is true whatever the external system answers.
+//
+// The timestamp is deliberately ABSENT here. With one present this would pass through the first
+// disjunct and say nothing about the second — which is exactly how the gap survived.
+func TestHandleObserve_DeletingReasonSurvivesWithoutATimestamp(t *testing.T) {
+	sid, err := shortid.New(1, shortid.DefaultABC, 2342)
+	require.NoError(t, err)
+	opts := createTestOptions()
+	ctrl, err := New(sid, opts)
+	require.NoError(t, err)
+
+	obj := createTestUnstructured("deleting-sticky", opts.Namespace)
+	require.NoError(t, unstructuredtools.SetConditions(obj, condition.Deleting()))
+	_, err = opts.Client.Resource(opts.GVR).Namespace(opts.Namespace).
+		Create(context.TODO(), obj, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	live, err := opts.Client.Resource(opts.GVR).Namespace(opts.Namespace).
+		Get(context.TODO(), obj.GetName(), metav1.GetOptions{})
+	require.NoError(t, err)
+	// PREMISE, both halves. Without the first this would be the timestamp case again; without the
+	// second there would be no Deleting to preserve and the arm would pass against any behaviour.
+	require.Nil(t, live.GetDeletionTimestamp(),
+		"premise: this arm exists for the case where NO timestamp is visible")
+	require.Equal(t, condition.ReasonDeleting, readyOf(t, live).Reason,
+		"premise: Ready must already read Deleting for there to be anything to preserve")
+
+	ctrl.SetExternalClient(&fakeExternalClient{ObserveErr: errors.New("vendor unreachable")})
+
+	ref := objectref.ObjectRef{APIVersion: obj.GetAPIVersion(), Kind: obj.GetKind(),
+		Name: obj.GetName(), Namespace: obj.GetNamespace()}
+	require.Error(t, ctrl.handleObserve(context.TODO(), ref))
+
+	updated, err := opts.Client.Resource(opts.GVR).Namespace(opts.Namespace).
+		Get(context.TODO(), obj.GetName(), metav1.GetOptions{})
+	require.NoError(t, err)
+
+	require.Equal(t, condition.ReasonDeleting, readyOf(t, updated).Reason,
+		"an object whose Ready already read Deleting must keep it: the re-fetch may not yet show "+
+			"the timestamp, and overwriting with ObserveFailed is a durable lie about an object "+
+			"whose fate is certain")
+	require.Equal(t, condition.ReasonReconcileError, syncedOf(t, updated).Reason,
+		"CONTROL: Synced must still carry the error, or this arm would also pass against a path "+
+			"that wrote no conditions at all")
+}
