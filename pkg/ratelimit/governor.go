@@ -2,7 +2,7 @@ package ratelimit
 
 import (
 	cryptorand "crypto/rand"
-	"encoding/binary"
+	"math/big"
 	"sync"
 	"time"
 )
@@ -199,6 +199,15 @@ func (g *aimd) Capacity(key string) int {
 // the reason given. crypto/rand costs eight bytes per deferral, which is nothing next to the
 // round-trip it is delaying.
 //
+// cryptorand.Int RATHER THAN READING BYTES AND REDUCING MODULO d, and the first version of this
+// function did the latter. It drew 8 bytes, took them mod uint64(d) and converted back with
+// time.Duration(...), which gosec then flagged as G115 (integer overflow conversion uint64 ->
+// int64). The conversion could not actually overflow — the result is in [0, d) and d fits in int64
+// — but the reduction had a real flaw the scanner did not name: `x % d` is not uniform unless d
+// divides 2^64, so it carried a slight bias toward small values. cryptorand.Int returns a uniform
+// value in [0, d) by rejection sampling, which removes the bias AND the conversion, so the scanner
+// is satisfied on the merits rather than by a suppression.
+//
 // On a read failure it returns d — the full delay, never a shorter one. Failing short is the
 // dangerous direction for a backoff: it is how a client comes back early, and early is how it gets
 // banned rather than throttled.
@@ -206,11 +215,11 @@ func jitter(d time.Duration) time.Duration {
 	if d <= 0 {
 		return 0
 	}
-	var b [8]byte
-	if _, err := cryptorand.Read(b[:]); err != nil {
+	n, err := cryptorand.Int(cryptorand.Reader, big.NewInt(int64(d)))
+	if err != nil {
 		return d
 	}
-	return d/2 + time.Duration(binary.LittleEndian.Uint64(b[:])%uint64(d))
+	return d/2 + time.Duration(n.Int64())
 }
 
 // RequeueAfter is how long a caller should wait before retrying a deferred item.
