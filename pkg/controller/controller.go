@@ -594,6 +594,15 @@ func (c *Controller) Run(ctx context.Context, numWorkers int) error {
 	defer c.queue.ShutDown()
 
 	c.logger.Info("Starting controller")
+	// "OFF BY DEFAULT" MUST BE VISIBLE. An operator who believes rate-limit protection is on and does
+	// not have it is worse off than one who knows they do not, and the two configurations behave
+	// identically until a server starts refusing. Both halves are named, because either alone
+	// leaves the gate open: a governor with a handler that is not a RateLimitKeyer gates nothing.
+	_, keyed := c.externalClient.(ratelimit.RateLimitKeyer)
+	c.logger.Info("Rate-limit governor",
+		"configured", c.governor != nil,
+		"handlerProvidesKeys", keyed,
+		"gating", c.governor != nil && keyed)
 	// The informer runs under the caller's ctx, so event intake stops the instant SIGTERM
 	// cancels it — no new work is admitted once shutdown begins.
 	go c.informer.Run(ctx.Done())

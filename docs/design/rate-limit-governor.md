@@ -261,6 +261,16 @@ Ready  = <unchanged>
   the passage of time — the single most common way a status field stops being true without anything
   changing.
 
+### A deferral is also the explanation for a stalled async poll
+
+A handler that drives a long-running operation by requeueing ("still pending, come back soon") has
+TWO deadlines once its endpoint is deferred: its own "poll again soon" and the governor's "do not
+call until T". The governor's wins — a poll is a call — so the operation will look stuck, and a
+handler that writes its own `Pending` condition will show that beside it. The `ReconcileDeferred`
+reason on Synced, with its message naming the key and the deadline, IS the explanation for that
+stall; consumers should read it before diagnosing the operation. Raised by the oasgen-provider
+review, from rest-dynamic-controller's requeue-based async mode.
+
 ### The reason string is a consumer contract, and must not repeat today's collision
 
 `ReconcileDeferred` must be **a value no other reason shares**. Today this package has:
@@ -357,6 +367,20 @@ without writing the condition; write `ObserveFailed` instead of `ReconcileDeferr
 1. **Should an advisory signal with no quota counters do anything?** A server that sends
    `Retry-After` on a 200 with no `X-RateLimit-*` is unusual but possible. Current proposal: treat it
    as advisory with capacity halved.
+
+   **Not to be confused with GitHub's secondary limits, which are refusals.** The oasgen-provider
+   review pointed out that a bare `Retry-After` is EXPECTED GitHub traffic, not a corner: secondary
+   limits arrive as 403 or 429 carrying only `Retry-After` (confirmed by the github-provider-kog
+   session; all 32 of its kinds call api.github.com natively). Those requests were REFUSED, so a
+   handler must report them `Throttled: true` — a hold until the deadline — and never as advisory.
+   Reported as advisory they would only halve capacity while the server keeps refusing. This
+   question stays about the 200 case alone.
+
+   **And a healthy GitHub response must not slow anything down.** GitHub sends `X-RateLimit-Reset`,
+   always in the future, on every response. The first governor read that boundary as a delay and
+   halved capacity on every successful call (fixed in #57, reported by the provider-runtime
+   session): counters above a quarter are now a no-op of their own, and only a cut restarts
+   recovery.
 2. **Per-verb keying.** Observe is read-only and cheap; Create/Update are not. A quota expressed in
    cost units (Azure's TSTUs) is not evenly consumed across verbs. Proposal: ignore for v1 and
    revisit with real numbers, because guessing the weights is worse than not weighting.

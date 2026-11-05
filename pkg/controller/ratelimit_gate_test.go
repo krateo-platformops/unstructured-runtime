@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 )
 
 // keyedClient is an ExternalClient that optionally names a rate-limit key and COUNTS its calls, so a
@@ -345,4 +346,49 @@ func TestGate_APassReleasesItsSlot(t *testing.T) {
 	require.True(t, errors.As(err, &deferred), "a held slot did not defer the pass (%v): the ceiling "+
 		"does not bind, so the loop above proves nothing", err)
 	require.Equal(t, ratelimit.DeferAtCapacity, deferred.Deferral.Reason)
+}
+
+// statusWrites counts the status writes the fake dynamic client has seen.
+func statusWrites(t *testing.T, opts Options) int {
+	t.Helper()
+	fc, ok := opts.Client.(*dynamicfake.FakeDynamicClient)
+	require.True(t, ok, "the test fixture's client is not the fake dynamic client")
+	n := 0
+	for _, a := range fc.Actions() {
+		if (a.GetVerb() == "patch" || a.GetVerb() == "update") && a.GetSubresource() == "status" {
+			n++
+		}
+	}
+	return n
+}
+
+// AN UNCHANGED DEFERRAL IS WRITTEN ONCE. A key at capacity requeues every second or two with the
+// same message, and a status patch per pass would spend API writes saying nothing new.
+func TestDeferPass_WritesAnUnchangedDeferralOnce(t *testing.T) {
+	const key = "github.example.com"
+	gov := ratelimit.New(ratelimit.Options{Ceiling: 4, RecoveryInterval: time.Hour})
+	deadline := time.Now().Add(time.Hour)
+	gov.Observe(ratelimit.Signal{Key: key, Throttled: true, ResetAt: deadline})
+	ctrl, evt, opts := gateController(t, gov, &keyedClient{key: key})
+
+	before := statusWrites(t, opts)
+	_ = ctrl.processItem(context.TODO(), evt)
+	first := statusWrites(t, opts)
+	require.Equal(t, before+1, first, "the first deferral must be recorded on status")
+
+	// The skipped write must still be a DEFERRAL. Returning nil here would read as success: runWorker
+	// would Forget the item and not requeue it, though the handler never ran.
+	var deferred *ratelimit.DeferredError
+	second := ctrl.processItem(context.TODO(), evt)
+	require.True(t, errors.As(second, &deferred),
+		"the already-recorded pass returned %v, not a DeferredError, so it would not be requeued", second)
+	require.Equal(t, first, statusWrites(t, opts),
+		"an IDENTICAL deferral was written again; every requeue during a throttle would cost a write")
+
+	// CONTROL: a NEW deadline changes the message and MUST be written, or the assertion above passes
+	// against a deferPass that writes only once ever and leaves a stale deadline on status.
+	gov.Observe(ratelimit.Signal{Key: key, Throttled: true, ResetAt: deadline.Add(time.Hour)})
+	_ = ctrl.processItem(context.TODO(), evt)
+	require.Equal(t, first+1, statusWrites(t, opts),
+		"a later server deadline was NOT written, so status names a deadline the server has extended")
 }

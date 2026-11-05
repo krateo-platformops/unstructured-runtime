@@ -744,7 +744,19 @@ func (c *Controller) acquireRateLimit(ctx context.Context, el *unstructured.Unst
 func (c *Controller) deferPass(ctx context.Context, el *unstructured.Unstructured, d *ratelimit.Deferral) error {
 	log := contextutils.Logger(ctx).WithValues("rateLimitKey", d.Key, "reason", string(d.Reason))
 
-	if err := unstructuredtools.SetConditions(el, condition.ReconcileDeferred(d.Key, d.Until)); err != nil {
+	cond := condition.ReconcileDeferred(d.Key, d.Until)
+	after := c.governor.RequeueAfter(d)
+
+	// AN UNCHANGED DEFERRAL IS NOT WRITTEN AGAIN. At capacity a key requeues every second or two
+	// with the same message, and during a long throttle every requeue carries the same deadline; a
+	// status patch per pass would spend API writes saying nothing new, against the apiserver of a
+	// controller that is already being asked to slow down.
+	if deferralAlreadyRecorded(el, cond) {
+		log.Debug("Reconciliation deferred by the rate-limit governor (already recorded)", "requeueAfter", after.String())
+		return &ratelimit.DeferredError{Deferral: d, After: after}
+	}
+
+	if err := unstructuredtools.SetConditions(el, cond); err != nil {
 		log.Error(err, "Cannot set the deferral condition")
 		c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))
 		return err
@@ -759,11 +771,21 @@ func (c *Controller) deferPass(ctx context.Context, el *unstructured.Unstructure
 		return err
 	}
 
-	after := c.governor.RequeueAfter(d)
 	log.Debug("Reconciliation deferred by the rate-limit governor", "requeueAfter", after.String())
-	c.recordEvent(el, event.Normal(reasonReconcileDeferred, actionProcessEvent,
-		"Reconciliation deferred: "+d.Key+" is rate-limited"))
+	c.recordEvent(el, event.Normal(reasonReconcileDeferred, actionProcessEvent, cond.Message))
 	return &ratelimit.DeferredError{Deferral: d, After: after}
+}
+
+// deferralAlreadyRecorded reports whether el's Synced condition already says exactly what cond says.
+// Status, Reason AND Message, because a new server deadline changes only the message and must be
+// written.
+func deferralAlreadyRecorded(el *unstructured.Unstructured, cond metav1.Condition) bool {
+	for _, have := range unstructuredtools.GetConditions(el) {
+		if have.Type == cond.Type {
+			return have.Status == cond.Status && have.Reason == cond.Reason && have.Message == cond.Message
+		}
+	}
+	return false
 }
 
 func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef) error {

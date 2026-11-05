@@ -353,12 +353,21 @@ func ReconcileError(err error) metav1.Condition {
 // deadline". The message then says so rather than inventing one — a deadline we made up is read by
 // a consumer as the server's.
 func ReconcileDeferred(key string, until time.Time) metav1.Condition {
-	msg := fmt.Sprintf("reconciliation deferred: %s is rate-limited", key)
+	// Two different statements, worded so neither can be read as the other. At capacity nothing has
+	// refused us — the runtime is pacing itself — so "rate-limited" would send an operator looking
+	// for a server-side limit that does not exist.
+	msg := fmt.Sprintf("reconciliation deferred: the runtime is holding calls to %s below its "+
+		"concurrency limit; no server deadline was given", key)
 	if !until.IsZero() {
+		// ROUNDED UP to the second. RFC3339 drops sub-second precision, and truncating would print an
+		// instant up to a second BEFORE the server's deadline — a time at which a retry is still
+		// refused.
+		next := until.UTC().Truncate(time.Second)
+		if next.Before(until) {
+			next = next.Add(time.Second)
+		}
 		msg = fmt.Sprintf("reconciliation deferred: %s is rate-limited by the server; next attempt %s",
-			key, until.UTC().Format(time.RFC3339))
-	} else {
-		msg += " and the runtime is holding below its own ceiling; no server deadline was given"
+			key, next.Format(time.RFC3339))
 	}
 	return metav1.Condition{
 		Type:               TypeSynced,
