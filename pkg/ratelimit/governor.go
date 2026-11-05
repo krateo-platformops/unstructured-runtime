@@ -52,11 +52,11 @@ const (
 )
 
 type keyState struct {
-	capacity   int
-	inFlight   int
-	holdUntil  time.Time
-	lastSignal time.Time
-	lastRaise  time.Time
+	capacity  int
+	inFlight  int
+	holdUntil time.Time
+	lastCut   time.Time
+	lastRaise time.Time
 }
 
 type aimd struct {
@@ -136,8 +136,10 @@ func (g *aimd) Observe(s Signal) {
 
 	now := g.opts.Now()
 	st := g.state(s.Key)
-	st.lastSignal = now
 
+	// ONLY A CUT RESTARTS THE RECOVERY CLOCK. A server that publishes counters sends them on EVERY
+	// response — GitHub does — so stamping every signal here meant a busy key never went one
+	// RecoveryInterval without one, and capacity cut once never came back.
 	switch {
 	case s.Throttled:
 		// THE SERVER'S OWN DEADLINE, NOT A HALVING. It has told us a specific instant; guessing a
@@ -145,6 +147,7 @@ func (g *aimd) Observe(s Signal) {
 		// throttled. Capacity also drops to the floor so that when the hold lifts we resume at one
 		// call rather than at the ceiling.
 		st.capacity = capacityFloor
+		st.lastCut = now
 		if d := s.deadline(now); d.After(st.holdUntil) {
 			st.holdUntil = d
 		}
@@ -154,12 +157,21 @@ func (g *aimd) Observe(s Signal) {
 		// This is the state that distinguishes this design from a retry loop — a retry loop can
 		// only discover a limit by hitting it.
 		st.capacity = max(capacityFloor, st.capacity/2)
+		st.lastCut = now
+
+	case s.HasQuota:
+		// HEALTHY QUOTA: counters present and above a quarter. Nothing to do — and it must be an
+		// arm of its own, ahead of the delay arm below. GitHub sends X-RateLimit-Reset, always in
+		// the future, on every response including Remaining=4900/5000; falling through to the
+		// delay arm read that window boundary as Azure's delay and halved capacity on every
+		// successful call, pinning a GitHub key at the floor.
 
 	case s.deadline(now).After(now):
 		// A delay with no quota counters and no refusal — Azure's advisory shape. Treated as
 		// advisory rather than throttled: the call SUCCEEDED, so closing the gate entirely would
 		// stop work the server was still willing to do.
 		st.capacity = max(capacityFloor, st.capacity/2)
+		st.lastCut = now
 	}
 }
 
@@ -171,10 +183,18 @@ func (g *aimd) maybeRaiseLocked(st *keyState, now time.Time) {
 	if now.Before(st.holdUntil) {
 		return // still held; raising now would just be undone
 	}
-	if !st.lastSignal.IsZero() && now.Sub(st.lastSignal) < g.opts.RecoveryInterval {
+	// RECOVERY COUNTS FROM THE LATER OF THE LAST CUT AND THE END OF THE HOLD. Counting from the cut
+	// alone meant a hold longer than RecoveryInterval raised capacity the instant it lifted — the
+	// first acquire after a 30s Retry-After went straight to 2 with no clean interval at the floor
+	// to show the server had actually recovered.
+	since := st.lastCut
+	if st.holdUntil.After(since) {
+		since = st.holdUntil
+	}
+	if !since.IsZero() && now.Sub(since) < g.opts.RecoveryInterval {
 		return
 	}
-	// The cooldown is separate from lastSignal so capacity rises at most once per interval even
+	// The cooldown is separate from lastCut so capacity rises at most once per interval even
 	// when signals stopped long ago — otherwise a key idle for an hour would jump straight to the
 	// ceiling on its next acquire, which is the burst recovery is meant to avoid.
 	if !st.lastRaise.IsZero() && now.Sub(st.lastRaise) < g.opts.RecoveryInterval {
