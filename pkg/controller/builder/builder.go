@@ -102,6 +102,7 @@ func Build(ctx context.Context, conf Configuration, optsFuncs ...FuncOption) (*c
 		MetricsServer:           metricsServer,
 		WatchAnnotations:        opts.watchAnnotations,
 		MaxRetries:              opts.maxRetries,
+		RateLimitGovernor:       opts.rateLimitGovernor,
 		ActionsEvent:            opts.actionsEvent,
 		GracefulShutdownTimeout: opts.gracefulShutdownTimeout,
 	})

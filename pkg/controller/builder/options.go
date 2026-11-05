@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"github.com/krateo-platformops/unstructured-runtime/pkg/ratelimit"
 	"time"
 
 	"github.com/krateo-platformops/unstructured-runtime/pkg/controller"
@@ -30,6 +31,10 @@ type options struct {
 	// After the maximum number of retries is reached, the event will be dropped from the queue.
 	// Default: 5
 	maxRetries int
+
+	// rateLimitGovernor, when set, slows reconciliation on server-side rate limits. Nil (the
+	// default) leaves the controller exactly as it was.
+	rateLimitGovernor ratelimit.Governor
 
 	// WachAnnotations is a map of annotations to watch for changes.
 	// The key is the annotation name, and the value is the event to trigger.
@@ -126,6 +131,14 @@ func WithTelemetryMetrics(m *telemetry.Metrics) func(o *options) {
 func WithMetrics(m metricsserver.Options) func(o *options) {
 	return func(o *options) {
 		o.metrics = m
+	}
+}
+
+// WithRateLimitGovernor enables automatic slow-down under server-side rate limits. It has effect
+// only for handlers that implement ratelimit.RateLimitKeyer; a handler that does not is never gated.
+func WithRateLimitGovernor(g ratelimit.Governor) func(o *options) {
+	return func(o *options) {
+		o.rateLimitGovernor = g
 	}
 }
 

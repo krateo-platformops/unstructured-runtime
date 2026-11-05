@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"github.com/krateo-platformops/unstructured-runtime/pkg/ratelimit"
 	"k8s.io/client-go/util/retry"
 	"time"
 
@@ -33,11 +34,14 @@ const (
 
 // Event reasons.
 const (
-	reasonCannotInitialize    event.Reason = "CannotInitializeManagedResource"
-	reasonCannotResolveRefs   event.Reason = "CannotResolveResourceReferences"
-	reasonCannotObserve       event.Reason = "CannotObserveExternalResource"
-	reasonCannotCreate        event.Reason = "CannotCreateExternalResource"
-	reasonCannotDelete        event.Reason = "CannotDeleteExternalResource"
+	reasonCannotInitialize  event.Reason = "CannotInitializeManagedResource"
+	reasonCannotResolveRefs event.Reason = "CannotResolveResourceReferences"
+	reasonCannotObserve     event.Reason = "CannotObserveExternalResource"
+	reasonCannotCreate      event.Reason = "CannotCreateExternalResource"
+	reasonCannotDelete      event.Reason = "CannotDeleteExternalResource"
+	// reasonReconcileDeferred: the rate-limit governor declined this pass. Normal, not Warning —
+	// nothing is wrong with the resource, and a Warning would page someone over a server's quota.
+	reasonReconcileDeferred   event.Reason = "ReconcileDeferred"
 	reasonCannotPublish       event.Reason = "CannotPublishConnectionDetails"
 	reasonCannotUnpublish     event.Reason = "CannotUnpublishConnectionDetails"
 	reasonCannotUpdate        event.Reason = "CannotUpdateExternalResource"
@@ -134,6 +138,31 @@ func (c *Controller) recordMetric(evt ctrlevent.Event, operation string, err err
 	).Inc()
 }
 
+// passOutcome is how a pass is COUNTED, which is a separate question from how it is requeued.
+type passOutcome int
+
+const (
+	outcomeSuccess passOutcome = iota
+	outcomeDeferred
+	outcomeFailure
+)
+
+// classifyOutcome decides which metric a pass increments. A DEFERRAL IS A REQUEUE-AFTER, NOT A
+// FAILURE: counting it as one would show a failure spike on every dashboard for as long as a server
+// is rate-limiting us, telling an operator things are breaking when nothing is. Extracted from
+// runWorker so the decision is testable without a running worker.
+func classifyOutcome(err error) passOutcome {
+	var deferred *ratelimit.DeferredError
+	switch {
+	case err == nil:
+		return outcomeSuccess
+	case errors.As(err, &deferred):
+		return outcomeDeferred
+	default:
+		return outcomeFailure
+	}
+}
+
 func (c *Controller) runWorker(ctx context.Context) {
 	// Generate unique worker ID for tracking
 	workerID := fmt.Sprintf("worker-%d", time.Now().UnixNano()%10000)
@@ -199,9 +228,12 @@ func (c *Controller) runWorker(ctx context.Context) {
 		if c.metrics != nil {
 			c.metrics.RecordQueueWorkDuration(ctx, processingDuration)
 			c.metrics.RecordReconcileDuration(ctx, totalDuration)
-			if err == nil {
+			switch classifyOutcome(err) {
+			case outcomeSuccess:
 				c.metrics.IncReconcileSuccess(ctx)
-			} else {
+			case outcomeDeferred:
+				c.metrics.IncReconcileRequeueAfter(ctx)
+			default:
 				c.metrics.IncReconcileFailure(ctx)
 				c.metrics.IncReconcileErrorRequeue(ctx)
 			}
@@ -261,6 +293,36 @@ func (c *Controller) runWorker(ctx context.Context) {
 
 func (c *Controller) handleErr(err error, obj ctrlevent.Event, priority int) {
 	if err == nil {
+		return
+	}
+
+	// A DEFERRAL IS HANDLED FIRST, AHEAD OF THE maxRetries CHECK, and differently from a failure in
+	// every respect that matters:
+	//
+	//	delay      the governor's — the server's own deadline when throttled, a short jitter when we
+	//	           are merely at capacity — never the failure limiter's exponential
+	//	limiter    NOT rate-limited. AddRateLimited would count the deferral toward NumRequeues and
+	//	           grow the item's backoff, so a global condition ("the endpoint is busy") would
+	//	           inflate a per-item one ("this item is failing") and could even hit maxRetries
+	//	           and DROP an event that had nothing wrong with it
+	//	priority   kept, so a deferred high-priority event is not demoted by being deferred
+	//	Forget     not called by runWorker, because err is non-nil (#52), so a deferral leaves the
+	//	           item's genuine failure history exactly as it found it
+	var deferred *ratelimit.DeferredError
+	if errors.As(err, &deferred) {
+		retryEvent := obj
+		if retryEvent.QueuedAt.IsZero() {
+			retryEvent.QueuedAt = time.Now()
+		}
+		dig := ctrlevent.DigestForEvent(retryEvent)
+		if _, loaded := c.items.Load(dig); !loaded {
+			c.items.Store(dig, struct{}{})
+			c.queue.AddWithOpts(priorityqueue.AddOpts{
+				After:       deferred.After,
+				RateLimited: false,
+				Priority:    priority,
+			}, obj)
+		}
 		return
 	}
 
@@ -419,6 +481,25 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 	//                           and proceed with a fresh create.
 	//   - resource is present => the create actually succeeded but we lost the
 	//                           success marker; record success and proceed.
+	// RATE-LIMIT GATE (docs/design/rate-limit-governor.md). Here and only here, deliberately:
+	//
+	//   AFTER every path that makes no external call. The pause short-circuit and the Orphan
+	//   finalizer release above talk only to the apiserver; gating them would delay a deletion
+	//   with nothing to throttle.
+	//   BEFORE the first call into the handler — externalResourceExists immediately below, then
+	//   the handleObserve/Create/Update/Delete dispatch. Measured: all five of those entry points,
+	//   plus the ExistenceChecker path, are reached ONLY from processItem, so this one gate covers
+	//   every way into the handler. A gate at each call site would be five places to keep in step,
+	//   and the plumbing dialguard enumeration showed what that costs: a check placed where a
+	//   mechanism already existed covered two paths of five and looked complete.
+	//
+	// The AST guard in ratelimit_wiring_test.go fails if a handler call ever appears ahead of it.
+	ctx, release, deferral := c.acquireRateLimit(ctx, el)
+	if deferral != nil {
+		return c.deferPass(ctx, el, deferral)
+	}
+	defer release()
+
 	if meta.ExternalCreateIncomplete(el) {
 		resourceExists, obsErr := c.externalResourceExists(ctx, el)
 
@@ -600,6 +681,111 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 		c.recordMetric(evt, "observe", err)
 		return err
 	}
+}
+
+// acquireRateLimit decides whether this pass may call the handler, and returns a context carrying
+// the governor as the signal sink when it may.
+//
+// THREE WAYS TO BE UNGATED, all of them "behave exactly as before":
+//
+//	no governor configured             the feature is off
+//	handler does not name a key        it never opted in (no ratelimit.RateLimitKeyer)
+//	the key cannot be determined       an error or an empty key from RateLimitKey
+//
+// THE THIRD FAILS OPEN, and that is the opposite of plumbing's dialguard on purpose. dialguard is a
+// security control, where "could not determine" must refuse: the cost of guessing wrong is a
+// credential sent somewhere it should not go. This is a throttle. Failing closed on a key it cannot
+// compute would stop every reconcile of the object for as long as the keyer is wrong — a wedge —
+// while failing open costs at most the 429 the server will enforce anyway. Same question, opposite
+// answer, because the two failures are not the same size.
+//
+// The sink is installed only when the pass is gated: a governor accumulating state for keys it can
+// never gate would be memory with no purpose.
+func (c *Controller) acquireRateLimit(ctx context.Context, el *unstructured.Unstructured) (context.Context, func(), *ratelimit.Deferral) {
+	noop := func() {}
+	if c.governor == nil {
+		return ctx, noop, nil
+	}
+	keyer, ok := c.externalClient.(ratelimit.RateLimitKeyer)
+	if !ok {
+		return ctx, noop, nil
+	}
+	key, err := keyer.RateLimitKey(el)
+	if err != nil {
+		contextutils.Logger(ctx).Warn("Cannot determine the rate-limit key; proceeding ungated", "err", err)
+		return ctx, noop, nil
+	}
+	if key == "" {
+		return ctx, noop, nil
+	}
+	release, d := c.governor.TryAcquire(key)
+	if d != nil {
+		return ctx, noop, d
+	}
+	return ratelimit.WithSink(ctx, c.governor), release, nil
+}
+
+// deferPass records that this pass was deferred and returns a DeferredError for the worker to
+// requeue.
+//
+// SYNCED ONLY, READY UNTOUCHED. The handler did not run, so nothing was learned about the resource;
+// Ready is the handler's finding, and overwriting it would repeat #45, where ObserveFailed
+// overwrote a handler's own verdict. Synced=False is correct: nothing is converging this object
+// right now, which is the semantic the pause conditions already carry.
+//
+// NOT SILENCE. A deferral that records nothing is indistinguishable from a pass that ran and found
+// everything fine, so a long backoff would leave conditions stale while reporting healthy. The
+// condition carries the deadline in its message, because "deferred" with no deadline becomes a lie
+// through elapsed time alone.
+//
+// A FAILED STATUS WRITE IS RETURNED AS A REAL ERROR, not as a DeferredError. That keeps an invariant
+// the tests can assert: every DeferredError the worker sees has already written its condition. The
+// deferral is simply re-evaluated on the retry.
+func (c *Controller) deferPass(ctx context.Context, el *unstructured.Unstructured, d *ratelimit.Deferral) error {
+	log := contextutils.Logger(ctx).WithValues("rateLimitKey", d.Key, "reason", string(d.Reason))
+
+	cond := condition.ReconcileDeferred(d.Key, d.Until)
+	after := c.governor.RequeueAfter(d)
+
+	// AN UNCHANGED DEFERRAL IS NOT WRITTEN AGAIN. At capacity a key requeues every second or two
+	// with the same message, and during a long throttle every requeue carries the same deadline; a
+	// status patch per pass would spend API writes saying nothing new, against the apiserver of a
+	// controller that is already being asked to slow down.
+	if deferralAlreadyRecorded(el, cond) {
+		log.Debug("Reconciliation deferred by the rate-limit governor (already recorded)", "requeueAfter", after.String())
+		return &ratelimit.DeferredError{Deferral: d, After: after}
+	}
+
+	if err := unstructuredtools.SetConditions(el, cond); err != nil {
+		log.Error(err, "Cannot set the deferral condition")
+		c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))
+		return err
+	}
+	el, err := tools.PatchStatusConditions(ctx, el, tools.UpdateOptions{
+		Pluralizer:    c.pluralizer,
+		DynamicClient: c.dynamicClient,
+	})
+	if err != nil {
+		log.Error(err, "Cannot record the deferral on status")
+		c.recordEvent(el, event.Warning(reasonCannotUpdateManaged, actionUpdateExternalResource, err))
+		return err
+	}
+
+	log.Debug("Reconciliation deferred by the rate-limit governor", "requeueAfter", after.String())
+	c.recordEvent(el, event.Normal(reasonReconcileDeferred, actionProcessEvent, cond.Message))
+	return &ratelimit.DeferredError{Deferral: d, After: after}
+}
+
+// deferralAlreadyRecorded reports whether el's Synced condition already says exactly what cond says.
+// Status, Reason AND Message, because a new server deadline changes only the message and must be
+// written.
+func deferralAlreadyRecorded(el *unstructured.Unstructured, cond metav1.Condition) bool {
+	for _, have := range unstructuredtools.GetConditions(el) {
+		if have.Type == cond.Type {
+			return have.Status == cond.Status && have.Reason == cond.Reason && have.Message == cond.Message
+		}
+	}
+	return false
 }
 
 func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef) error {

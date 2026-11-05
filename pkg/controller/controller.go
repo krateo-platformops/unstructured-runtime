@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"github.com/krateo-platformops/unstructured-runtime/pkg/ratelimit"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sync"
 	"time"
@@ -131,6 +132,11 @@ type Options struct {
 	MaxRetries        int
 	ActionsEvent      ctrlevent.ActionsEvent
 
+	// RateLimitGovernor slows reconciliation when a server expresses a rate limit. Nil disables it
+	// entirely and the controller behaves exactly as before: no gating, no deferrals, no new
+	// conditions. See pkg/ratelimit and docs/design/rate-limit-governor.md.
+	RateLimitGovernor ratelimit.Governor
+
 	// GracefulShutdownTimeout bounds how long Run keeps the process alive after its
 	// context is cancelled (SIGTERM), letting in-flight reconciles finish before exit.
 	// Pointer semantics mirror controller-runtime's manager.Options.GracefulShutdownTimeout:
@@ -184,6 +190,7 @@ type Controller struct {
 	metrics           *telemetry.Metrics
 	externalClient    ExternalClient
 	maxRetries        int
+	governor          ratelimit.Governor
 
 	// gracefulShutdownTimeout is the resolved drain window used by Run on shutdown.
 	// Guarded by gracefulShutdownMu so a future leader-election runnable can zero it via
@@ -566,6 +573,7 @@ func New(sid *shortid.Shortid, opts Options) (*Controller, error) {
 		pluralizer:              opts.Pluralizer,
 		metricsServer:           opts.MetricsServer,
 		maxRetries:              opts.MaxRetries,
+		governor:                opts.RateLimitGovernor,
 		gracefulShutdownTimeout: gracefulShutdownTimeout,
 	}, nil
 }
@@ -586,6 +594,15 @@ func (c *Controller) Run(ctx context.Context, numWorkers int) error {
 	defer c.queue.ShutDown()
 
 	c.logger.Info("Starting controller")
+	// "OFF BY DEFAULT" MUST BE VISIBLE. An operator who believes rate-limit protection is on and does
+	// not have it is worse off than one who knows they do not, and the two configurations behave
+	// identically until a server starts refusing. Both halves are named, because either alone
+	// leaves the gate open: a governor with a handler that is not a RateLimitKeyer gates nothing.
+	_, keyed := c.externalClient.(ratelimit.RateLimitKeyer)
+	c.logger.Info("Rate-limit governor",
+		"configured", c.governor != nil,
+		"handlerProvidesKeys", keyed,
+		"gating", c.governor != nil && keyed)
 	// The informer runs under the caller's ctx, so event intake stops the instant SIGTERM
 	// cancels it — no new work is admitted once shutdown begins.
 	go c.informer.Run(ctx.Done())
