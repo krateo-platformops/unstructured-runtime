@@ -739,13 +739,17 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 // acquireRateLimit decides whether this pass may call the handler, and returns a context carrying
 // the governor as the signal sink when it may.
 //
-// THREE WAYS TO BE UNGATED, all of them "behave exactly as before":
+// WITHOUT A GOVERNOR NOTHING IS GATED. With one, the pass always asks it, with the handler's key or
+// with "" when there is none:
 //
-//	no governor configured             the feature is off
 //	handler does not name a key        it never opted in (no ratelimit.RateLimitKeyer)
 //	the key cannot be determined       an error or an empty key from RateLimitKey
 //
-// THE THIRD FAILS OPEN, and that is the opposite of plumbing's dialguard on purpose. dialguard is a
+// A keyless pass is not gated by any key's state, but IS gated by the governor's local capacity when
+// saturation is on (#66): the controller's own CPU bounds every pass, keyed or not. Without
+// saturation a keyless pass is not gated at all, exactly as before.
+//
+// AN UNDETERMINABLE KEY FAILS OPEN to keyless, and that is the opposite of plumbing's dialguard on purpose. dialguard is a
 // security control, where "could not determine" must refuse: the cost of guessing wrong is a
 // credential sent somewhere it should not go. This is a throttle. Failing closed on a key it cannot
 // compute would stop every reconcile of the object for as long as the keyer is wrong — a wedge —
@@ -759,21 +763,22 @@ func (c *Controller) acquireRateLimit(ctx context.Context, el *unstructured.Unst
 	if c.governor == nil {
 		return ctx, noop, nil
 	}
-	keyer, ok := c.externalClient.(ratelimit.RateLimitKeyer)
-	if !ok {
-		return ctx, noop, nil
-	}
-	key, err := keyer.RateLimitKey(el)
-	if err != nil {
-		contextutils.Logger(ctx).Warn("Cannot determine the rate-limit key; proceeding ungated", "err", err)
-		return ctx, noop, nil
-	}
-	if key == "" {
-		return ctx, noop, nil
+	key := ""
+	if keyer, ok := c.externalClient.(ratelimit.RateLimitKeyer); ok {
+		k, err := keyer.RateLimitKey(el)
+		if err != nil {
+			contextutils.Logger(ctx).Warn("Cannot determine the rate-limit key; proceeding without one (the local capacity still applies)", "err", err)
+		} else {
+			key = k
+		}
 	}
 	release, d := c.governor.TryAcquire(key)
 	if d != nil {
 		return ctx, noop, d
+	}
+	if key == "" {
+		// Gated by the local capacity at most: no key's state to feed, so no sink.
+		return ctx, release, nil
 	}
 	return ratelimit.WithSink(ctx, c.governor), release, nil
 }
@@ -797,8 +802,20 @@ func (c *Controller) acquireRateLimit(ctx context.Context, el *unstructured.Unst
 func (c *Controller) deferPass(ctx context.Context, el *unstructured.Unstructured, d *ratelimit.Deferral) error {
 	log := contextutils.Logger(ctx).WithValues("rateLimitKey", d.Key, "reason", string(d.Reason))
 
-	cond := condition.ReconcileDeferred(d.Key, d.Until)
 	after := c.governor.RequeueAfter(d)
+	// THE QUIET RAMP (#66, provider-runtime's first trap). The startup ramp is a planned slow start
+	// that clears itself; writing Synced=False for it would make a restart with N objects write N
+	// conditions, all false alarms. It is quiet here with NO caveat: the gate runs before every
+	// handler call, so a deferred pass has learned nothing that could need writing. Every other
+	// local deferral (saturated, recovering, an unstarted sampler) is written.
+	if d.Reason == ratelimit.DeferRamping {
+		log.Debug("Reconciliation deferred on the controller's startup ramp (not recorded)", "requeueAfter", after.String())
+		return &ratelimit.DeferredError{Deferral: d, After: after}
+	}
+	cond := condition.ReconcileDeferred(d.Key, d.Until)
+	if d.Local {
+		cond = condition.LocalReconcileDeferred(d.Capacity, d.Cause)
+	}
 
 	// AN UNCHANGED DEFERRAL IS NOT WRITTEN AGAIN. At capacity a key requeues every second or two
 	// with the same message, and during a long throttle every requeue carries the same deadline; a
