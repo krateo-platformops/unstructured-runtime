@@ -189,17 +189,25 @@ func (g *aimd) Observe(s Signal) {
 		st.capacity = max(capacityFloor, st.capacity/2)
 		st.lastCut = now
 
+	case s.RetryAfter > 0:
+		// AN EXPLICIT DELAY IS ALWAYS A CUT, whatever the counters say: the server is ASKING us to
+		// wait. The time fields are told apart by WHICH ONE carries the time, not by whether
+		// counters are present — RetryAfter is a request, ResetAt is only a window boundary. This
+		// order matches provider-runtime's Classify, so the shared vocabulary gets one answer in
+		// both runtimes (raised in the #57 review). Advisory rather than throttled: the call
+		// SUCCEEDED, so closing the gate would stop work the server was still willing to do.
+		st.capacity = max(capacityFloor, st.capacity/2)
+		st.lastCut = now
+
 	case s.HasQuota:
-		// HEALTHY QUOTA: counters present and above a quarter. Nothing to do — and it must be an
-		// arm of its own, ahead of the delay arm below. GitHub sends X-RateLimit-Reset, always in
-		// the future, on every response including Remaining=4900/5000; falling through to the
-		// delay arm read that window boundary as Azure's delay and halved capacity on every
-		// successful call, pinning a GitHub key at the floor.
+		// HEALTHY QUOTA: counters above a quarter and no delay asked for. Nothing to do — and it
+		// must come BEFORE the reset arm below. GitHub sends X-RateLimit-Reset, always in the
+		// future, on every response including Remaining=4900/5000; reading that boundary as a delay
+		// halved capacity on every successful call and pinned a GitHub key at the floor (#57).
 
 	case s.deadline(now).After(now):
-		// A delay with no quota counters and no refusal — Azure's advisory shape. Treated as
-		// advisory rather than throttled: the call SUCCEEDED, so closing the gate entirely would
-		// stop work the server was still willing to do.
+		// A FUTURE RESET WITH NOTHING ELSE TO GO ON — no counters, no delay. The boundary is all the
+		// server said, so it is the only evidence there is; treated as advisory.
 		st.capacity = max(capacityFloor, st.capacity/2)
 		st.lastCut = now
 	}
