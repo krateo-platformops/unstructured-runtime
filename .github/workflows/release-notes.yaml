@@ -12,9 +12,13 @@
 # expired credential skips the job with a warning rather than a red tick.
 name: release-notes
 
+# A Go module's tags carry the `v` prefix the module system requires (v1.9.0), so the trigger must
+# match it. The original pattern was copied from the image repos, whose tags are unprefixed, and it
+# matched NO tag here: 0 runs ever (#60). The org reusable is prefix-agnostic (it finds the previous
+# tag with `git describe --tags --exclude=$TAG $TAG^`, by commit topology).
 on:
   push:
-    tags: ["[0-9]+.[0-9]+.[0-9]+"]
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
   workflow_dispatch:
     inputs:
       tag:
