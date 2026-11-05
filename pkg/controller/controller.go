@@ -601,12 +601,29 @@ func (c *Controller) Run(ctx context.Context, numWorkers int) error {
 	// identically until a server starts refusing. Both halves are named, because either alone
 	// leaves the gate open: a governor with a handler that is not a RateLimitKeyer gates nothing.
 	_, keyed := c.externalClient.(ratelimit.RateLimitKeyer)
+	// The local capacity (#66) gates every pass, keyed or not, so "gating" is true with it even for a
+	// handler that names no key.
+	saturating := false
+	if lc, ok := c.governor.(interface{ LocalCapacity() int }); ok {
+		saturating = lc.LocalCapacity() > 0
+	}
 	c.logger.Info("Rate-limit governor",
 		"configured", c.governor != nil,
 		"handlerProvidesKeys", keyed,
-		"gating", c.governor != nil && keyed)
+		"localSaturation", saturating,
+		"gating", c.governor != nil && (keyed || saturating))
 	// The informer runs under the caller's ctx, so event intake stops the instant SIGTERM
 	// cancels it — no new work is admitted once shutdown begins.
+	// A governor with a background loop (the CPU sampler, #66) runs for exactly the controller's
+	// lifetime. Started here because nothing else would: without it the local capacity stays at 1, and
+	// the governor says so on every deferred object rather than passing it off as the startup ramp.
+	if starter, ok := c.governor.(ratelimit.Starter); ok {
+		go func() {
+			if err := starter.Start(ctx); err != nil {
+				c.logger.Error(err, "Rate-limit governor's background loop stopped")
+			}
+		}()
+	}
 	go c.informer.Run(ctx.Done())
 
 	// Start metrics server in goroutine so it doesn't block
