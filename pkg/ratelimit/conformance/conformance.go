@@ -43,7 +43,7 @@ func Capture(ctx context.Context, call func(context.Context) error) (*Recorder, 
 // with no RetryAfter and no ResetAt tells the governor to stop and never says for how long, which
 // it can only treat as advisory. A handler that drops the server's Retry-After has reported
 // something unusable, and that is worth failing on rather than warning about.
-func AssertReportsThrottle(t *testing.T, call func(context.Context) error) {
+func AssertReportsThrottle(t testing.TB, call func(context.Context) error) {
 	t.Helper()
 	rec, _ := Capture(context.Background(), call)
 	// The error is deliberately ignored: a throttled call SHOULD normally fail, and asserting on
@@ -89,7 +89,7 @@ func AssertReportsThrottle(t *testing.T, call func(context.Context) error) {
 // publishes its delay on a SUCCESSFUL response — it says it is delaying you before it refuses you.
 // A handler that only reports on errors misses it entirely, and with it the whole point of
 // automatic slow-down: reacting before being throttled rather than after.
-func AssertReportsAdvisory(t *testing.T, call func(context.Context) error) {
+func AssertReportsAdvisory(t testing.TB, call func(context.Context) error) {
 	t.Helper()
 	rec, err := Capture(context.Background(), call)
 	if err != nil {
@@ -111,21 +111,41 @@ func AssertReportsAdvisory(t *testing.T, call func(context.Context) error) {
 		"error-only reporter can react only after throttling has begun", len(rec.Signals))
 }
 
-// AssertSilentWhenHealthy fails t if call reported anything for a clean response.
+// AssertHealthyDoesNotSlowDown fails t if what call reported for a HEALTHY response would slow a
+// governor down.
 //
 // THE CONTROL, and without it the two asserts above are satisfied by a handler that reports a
-// throttle on every single response. Such a handler would pin capacity to the floor forever while
-// passing conformance.
-func AssertSilentWhenHealthy(t *testing.T, call func(context.Context) error) {
+// throttle on every single response, which would pin capacity to the floor forever while passing
+// conformance.
+//
+// IT ASSERTS THE EFFECT, NOT SILENCE. Its first version required zero signals, and that is wrong
+// for exactly the vendors this exists for: GitHub publishes its counters on every response, and a
+// handler that forwards them is correct — the advisory arm depends on them. So the reported signals
+// are replayed into a fresh governor and the check is that it neither cut capacity nor closed the
+// gate. A healthy quota report passes; a throttle, a low quota or a bare delay fails.
+func AssertHealthyDoesNotSlowDown(t testing.TB, call func(context.Context) error) {
 	t.Helper()
 	rec, err := Capture(context.Background(), call)
 	if err != nil {
 		t.Fatalf("the healthy call failed (%v); the fixture is wrong", err)
 	}
-	if len(rec.Signals) != 0 {
-		t.Errorf("the handler reported %d signal(s) for a response with no rate-limit information: "+
-			"%+v. Reporting unconditionally would hold capacity at the floor forever",
-			len(rec.Signals), rec.Signals)
+
+	const ceiling = 8
+	g := ratelimit.New(ratelimit.Options{Ceiling: ceiling, RecoveryInterval: time.Hour})
+	keys := map[string]bool{}
+	for _, s := range rec.Signals {
+		g.Observe(s)
+		keys[s.Key] = true
+	}
+	// Capacity alone is the whole check: a throttle drops capacity to the floor as well as holding
+	// the key, so a closed gate always shows up here first. A separate TryAcquire check could never
+	// fail on its own, and a mutant removing it proved that.
+	for key := range keys {
+		if c := g.Capacity(key); c != ceiling {
+			t.Errorf("a HEALTHY response cut capacity for key %q to %d of %d. Signals reported: %+v. "+
+				"A handler that slows down on success throttles itself for no reason",
+				key, c, ceiling, rec.Signals)
+		}
 	}
 }
 
