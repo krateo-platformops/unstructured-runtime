@@ -4,19 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
-	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/krateo-platformops/unstructured-runtime/pkg/workqueue"
 
-	"github.com/go-logr/logr"
 	"github.com/krateo-platformops/plumbing/shortid"
 	ctrlevent "github.com/krateo-platformops/unstructured-runtime/pkg/controller/event"
 	"github.com/krateo-platformops/unstructured-runtime/pkg/controller/objectref"
 	"github.com/krateo-platformops/unstructured-runtime/pkg/controller/priorityqueue"
-	"github.com/krateo-platformops/unstructured-runtime/pkg/logging"
 	"github.com/krateo-platformops/unstructured-runtime/pkg/meta"
 	unstructuredtools "github.com/krateo-platformops/unstructured-runtime/pkg/tools/unstructured"
 	"github.com/krateo-platformops/unstructured-runtime/pkg/tools/unstructured/condition"
@@ -75,31 +72,55 @@ func (f *fakeExternalClientObserveError) Delete(ctx context.Context, mg *unstruc
 	return nil
 }
 
+// countingObserveError fails every Observe and counts the calls, so the test can assert HOW MANY
+// passes ran — a monotonic witness — instead of sampling NumRequeues and the digest, both of which
+// oscillate while retries are in flight.
+type countingObserveError struct {
+	calls atomic.Int32
+	err   error
+}
+
+func (f *countingObserveError) Observe(ctx context.Context, mg *unstructured.Unstructured) (ExternalObservation, error) {
+	f.calls.Add(1)
+	return ExternalObservation{}, f.err
+}
+func (f *countingObserveError) Create(ctx context.Context, mg *unstructured.Unstructured) error {
+	return nil
+}
+func (f *countingObserveError) Update(ctx context.Context, mg *unstructured.Unstructured) error {
+	return nil
+}
+func (f *countingObserveError) Delete(ctx context.Context, mg *unstructured.Unstructured) error {
+	return nil
+}
+
+// The contract: an event whose processing always fails is processed exactly maxRetries+1 times (the
+// first pass plus maxRetries requeues), then dropped — its digest gone from controller.items and
+// nothing left in the queue — and it is NOT processed again.
+//
+// The previous version polled NumRequeues >= 3 and then asserted the digest was gone. NumRequeues
+// reaches 3 inside the THIRD requeue's AddWithOpts, after handleErr has re-Stored the digest, while
+// the fourth pass (the one that drops) is still pending — so the assertion sampled a state the
+// worker passes through on every run and failed whenever the poll landed in that window.
 func TestRunWorker_RequeuesOnProcessErrorAndRemovesItem(t *testing.T) {
+	const maxRetries = 3
 	sid, err := shortid.New(1, shortid.DefaultABC, 2342)
 	require.NoError(t, err)
-	lh := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level:     slog.LevelDebug,
-		AddSource: false,
-	})
 	opts := createTestOptions()
-	opts.MaxRetries = 3
+	opts.MaxRetries = maxRetries
 	opts.ResyncInterval = 3 * time.Second
 	opts.GlobalRateLimiter = workqueue.NewExponentialTimedFailureRateLimiter[any](1*time.Millisecond, 100*time.Millisecond)
-	opts.Logger = logging.NewLogrLogger(logr.FromSlogHandler(slog.New(lh).Handler()))
 	ctrl, err := New(sid, opts)
 	require.NoError(t, err)
 	require.NotNil(t, ctrl)
 
-	// create managed object that processItem will fetch
 	obj := createTestUnstructured("rw-obj", opts.Namespace)
 	_, err = opts.Client.Resource(opts.GVR).Namespace(opts.Namespace).Create(context.TODO(), obj, metav1.CreateOptions{})
 	require.NoError(t, err)
 
-	// set external client that returns an error on Observe to force processItem -> error
-	ctrl.SetExternalClient(&fakeExternalClientObserveError{err: fmt.Errorf("observe-boom")})
+	ec := &countingObserveError{err: fmt.Errorf("observe-boom")}
+	ctrl.SetExternalClient(ec)
 
-	// build event and store its digest in items (the real flow sets this before queueing)
 	item := ctrlevent.Event{
 		EventType: ctrlevent.Observe,
 		ObjectRef: objectref.ObjectRef{
@@ -112,31 +133,34 @@ func TestRunWorker_RequeuesOnProcessErrorAndRemovesItem(t *testing.T) {
 	}
 	dig := ctrlevent.DigestForEvent(item)
 	ctrl.items.Store(dig, struct{}{})
-
-	// enqueue the event
 	ctrl.queue.AddWithOpts(priorityqueue.AddOpts{RateLimited: false, Priority: NormalPriority}, item)
 
-	// run worker in goroutine
 	done := make(chan struct{})
 	go func() {
 		ctrl.runWorker(context.Background())
 		close(done)
 	}()
+	// Stop the worker when the test ends. Without this every iteration of -count=N leaked a parked
+	// worker and its queue goroutines into the next.
+	t.Cleanup(func() {
+		ctrl.queue.ShutDown()
+		<-done
+	})
 
-	// wait for a requeue to appear (handleErr should add it back)
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if ctrl.queue.NumRequeues(item) >= 3 {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		_, present := ctrl.items.Load(dig)
+		assert.Equal(c, int32(maxRetries+1), ec.calls.Load(), "passes (first pass + maxRetries requeues)")
+		assert.False(c, present, "digest still in controller.items")
+		assert.Zero(c, ctrl.queue.Len(), "queue length")
+	}, 3*time.Second, 5*time.Millisecond, "expected exactly %d passes, then a drop", maxRetries+1)
 
-	require.GreaterOrEqual(t, ctrl.queue.NumRequeues(item), 1, "expected at least one requeue for the failed event")
-
-	// ensure the digest was removed from items by runWorker
-	_, ok := ctrl.items.Load(dig)
-	require.False(t, ok, "expected digest to be removed from controller.items after processing")
+	// And it stays dropped: no further pass, no digest re-stored. The window is several times the
+	// largest backoff this limiter can produce (maxDelay=100ms), so a fifth pass would land in it.
+	require.Never(t, func() bool {
+		_, present := ctrl.items.Load(dig)
+		return ec.calls.Load() != maxRetries+1 || present
+	}, 300*time.Millisecond, 5*time.Millisecond, "event was processed again, or its digest re-stored, after the drop")
+	assert.Equal(t, maxRetries, ctrl.queue.NumRequeues(item), "the dropped event's failure count")
 }
 
 func TestRunWorker_ShutDown(t *testing.T) {
