@@ -47,6 +47,13 @@ type Governor interface {
 //
 // It must do NO I/O: it runs before every gated call, and a keyer that made a request to decide
 // whether a request is allowed would be a rate-limit problem of its own.
+//
+// AN ERROR FAILS OPEN: the pass runs ungated. That is safe ONLY because the gate is a throttle and
+// not a security control. A handler must not use RateLimitKey to refuse a call — a host it may not
+// talk to, a credential it may not send — because the refusal is then silently dropped. Enforce
+// those on the request path itself, where they hold whether or not a keyer ran (rest-dynamic-
+// controller checks its host policy at request time and on every redirect hop, and fails closed
+// with no policy — which is why its fail-open here is safe; the oasgen-provider review).
 type RateLimitKeyer interface {
 	RateLimitKey(mg *unstructured.Unstructured) (string, error)
 }
