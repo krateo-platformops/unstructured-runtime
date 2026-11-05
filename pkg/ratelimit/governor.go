@@ -5,6 +5,8 @@ import (
 	"math/big"
 	"sync"
 	"time"
+
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 // Governor decides how much concurrency a key currently gets.
@@ -26,6 +28,27 @@ type Governor interface {
 	// Capacity reports the current effective concurrency for a key, for metrics and tests. It is
 	// the number an operator used to set by hand.
 	Capacity(key string) int
+
+	// RequeueAfter is how long a deferred item should wait before it is retried. On the interface
+	// rather than only on the concrete type because the WORKER is what requeues, and it holds a
+	// Governor. The first version had it as a method on *aimd alone, so nothing that held the
+	// interface could reach it — found while wiring the worker, before any caller existed.
+	RequeueAfter(d *Deferral) time.Duration
+}
+
+// RateLimitKeyer lets a handler name its rate-limit scope BEFORE a call is made. Optional: a
+// handler that does not implement it is never gated.
+//
+// THIS CLOSES A CIRCULAR DEPENDENCY in the first draft of the design, found by the
+// provider-runtime session. TryAcquire needs the key before the call; a Signal carries the key only
+// once the handler has made the call. Both halves were written and neither could be satisfied. It
+// was then written into the design document and not into this package, so it stayed open until the
+// worker was wired and needed it.
+//
+// It must do NO I/O: it runs before every gated call, and a keyer that made a request to decide
+// whether a request is allowed would be a rate-limit problem of its own.
+type RateLimitKeyer interface {
+	RateLimitKey(mg *unstructured.Unstructured) (string, error)
 }
 
 // Options configures an AIMD governor.

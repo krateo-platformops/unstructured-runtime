@@ -119,3 +119,28 @@ type Deferral struct {
 	// where the caller requeues with a short jittered delay instead of claiming a deadline.
 	Until time.Time
 }
+
+// DeferredError is what a reconcile pass returns when the governor declined to let it call the
+// handler. It is an error only so it can travel the worker's existing return path; it is NOT a
+// failure, and every consumer of the error must treat it as one of the following, never as the
+// other:
+//
+//	requeue   with After as the delay, keeping the item's priority, WITHOUT the rate-limited add —
+//	          the failure limiter would count it toward maxRetries and grow its backoff, which
+//	          conflates "this item is failing" with "the endpoint is busy"
+//	metrics   as a deferral, never as a reconcile failure — counting it as one would show a
+//	          failure spike on every dashboard during rate limiting, telling an operator things are
+//	          breaking when nothing is
+//	Forget    NOT called: the item's genuine failure history must survive a deferral, which is
+//	          what the worker already does for any non-nil error since #52
+type DeferredError struct {
+	Deferral *Deferral
+	After    time.Duration
+}
+
+func (e *DeferredError) Error() string {
+	if e.Deferral == nil {
+		return "reconcile deferred"
+	}
+	return "reconcile deferred: " + e.Deferral.Key + " " + string(e.Deferral.Reason)
+}
