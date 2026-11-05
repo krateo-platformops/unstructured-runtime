@@ -9,9 +9,12 @@ import (
 
 	"github.com/stretchr/testify/require"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	clientfeatures "k8s.io/client-go/features"
 	clienttesting "k8s.io/client-go/testing"
 )
 
@@ -129,4 +132,72 @@ func TestReadyzCheck_ListThatNeverSucceeds_StaysNotReady(t *testing.T) {
 		t.Fatal("Run did not return after cancel")
 	}
 	require.Error(t, c.ReadyzCheck(nil), "a controller stopped before it ever listed cannot be ready")
+}
+
+// TestReadyzCheck_WatchListMode_NotReadyUntilInitialEventsEnd_ThenReady repeats the transition with
+// the WatchListClient gate ON, which is client-go v0.35's DEFAULT and therefore what a deployed
+// controller runs. This package's TestMain switches the gate off for every other test (the fake
+// never sends the initial-events bookmark), so without this test the readiness decision would be
+// proven only on the path production does not take first.
+//
+// In this mode the reflector first opens a streaming watch. For an unserved resource that watch
+// fails, the reflector falls back to a LIST (client-go tools/cache/reflector.go, ListAndWatchWithContext),
+// and the LIST fails too: that fallback is where the measured "failed to list" comes from. When the
+// resource is served, the stream delivers a bookmark carrying k8s.io/initial-events-end and no LIST
+// happens at all. Both halves are counted, so the test also proves which path it exercised.
+func TestReadyzCheck_WatchListMode_NotReadyUntilInitialEventsEnd_ThenReady(t *testing.T) {
+	type featureSetter interface {
+		Set(clientfeatures.Feature, bool) error
+	}
+	fg, ok := clientfeatures.FeatureGates().(featureSetter)
+	require.True(t, ok, "client-go feature gates are not settable; this test cannot select watch-list mode")
+	require.NoError(t, fg.Set(clientfeatures.WatchListClient, true))
+	t.Cleanup(func() { require.NoError(t, fg.Set(clientfeatures.WatchListClient, false)) })
+
+	gate := &listGate{}
+	gate.failing.Store(true)
+	opts := drainTestOptions(nil, durPtr(0))
+	gate.install(t, opts)
+	var watchFailures, streams atomic.Int32
+	fc := opts.Client.(*dynamicfake.FakeDynamicClient)
+	gr := opts.GVR.GroupResource()
+	fc.PrependWatchReactor(opts.GVR.Resource, func(clienttesting.Action) (bool, watch.Interface, error) {
+		if gate.failing.Load() {
+			watchFailures.Add(1)
+			return true, nil, apierrors.NewGenericServerResponse(http.StatusNotFound, "watch", gr, "", "", 0, true)
+		}
+		streams.Add(1)
+		w := watch.NewFakeWithChanSize(1, false)
+		end := &unstructured.Unstructured{}
+		end.SetResourceVersion("1")
+		end.SetAnnotations(map[string]string{metav1.InitialEventsAnnotationKey: "true"})
+		w.Action(watch.Bookmark, end)
+		return true, w, nil
+	})
+	c := newDrainController(t, opts, &mockExternalClient{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- c.Run(ctx, 1) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-runDone:
+		case <-time.After(10 * time.Second):
+			t.Error("Run did not return after cancel")
+		}
+	})
+
+	// Before: the stream was attempted and failed, and so was the fallback LIST, twice.
+	require.Eventually(t, func() bool { return gate.failures.Load() >= 2 }, 15*time.Second, 10*time.Millisecond,
+		"the reflector never fell back to a list")
+	require.GreaterOrEqual(t, watchFailures.Load(), int32(2), "the LIST was not reached through a failed watch-list stream; wrong mode")
+	require.Error(t, c.ReadyzCheck(nil), "ready while the stream and the list both fail")
+
+	gate.failing.Store(false)
+
+	require.Eventually(t, func() bool { return c.ReadyzCheck(nil) == nil }, 15*time.Second, 10*time.Millisecond,
+		"still not ready after the stream delivered initial-events-end")
+	require.GreaterOrEqual(t, streams.Load(), int32(1))
+	require.Zero(t, gate.successes.Load(), "synced through a LIST, so this did not exercise the watch-list path")
 }
