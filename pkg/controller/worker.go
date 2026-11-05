@@ -227,6 +227,18 @@ func (c *Controller) runWorker(ctx context.Context) {
 			continue
 		}
 		ctx = contextutils.BuildContext(ctx, contextutils.WithLogger(c.logger), contextutils.WithTraceId(traceId))
+
+		// ONE PASS PER OBJECT (#62). Another worker already holds this object, so park the event; it is
+		// requeued when that pass ends. Its `items` digest stays stored while parked, so further events
+		// of the same type keep deduplicating against it. Claimed here, after every early `continue`
+		// above, so no path leaves an object held.
+		if !c.objects.begin(ev, priority) {
+			c.queue.Done(ev)
+			if c.metrics != nil {
+				c.metrics.AddReconcileInFlight(-1)
+			}
+			continue
+		}
 		err = c.processItem(ctx, ev)
 
 		// End timing and calculate durations
@@ -299,6 +311,9 @@ func (c *Controller) runWorker(ctx context.Context) {
 		}
 		c.queue.Done(ev)
 		c.handleErr(err, ev, priority)
+		for _, p := range c.objects.end(ev) {
+			c.queue.AddWithOpts(priorityqueue.AddOpts{RateLimited: false, Priority: p.priority}, p.event)
+		}
 		if c.metrics != nil {
 			c.metrics.AddReconcileInFlight(-1)
 		}

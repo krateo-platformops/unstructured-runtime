@@ -191,6 +191,7 @@ type Controller struct {
 	externalClient    ExternalClient
 	maxRetries        int
 	governor          ratelimit.Governor
+	objects           *objectGate
 
 	// gracefulShutdownTimeout is the resolved drain window used by Run on shutdown.
 	// Guarded by gracefulShutdownMu so a future leader-election runnable can zero it via
@@ -574,6 +575,7 @@ func New(sid *shortid.Shortid, opts Options) (*Controller, error) {
 		metricsServer:           opts.MetricsServer,
 		maxRetries:              opts.MaxRetries,
 		governor:                opts.RateLimitGovernor,
+		objects:                 newObjectGate(),
 		gracefulShutdownTimeout: gracefulShutdownTimeout,
 	}, nil
 }
