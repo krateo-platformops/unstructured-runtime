@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -75,7 +76,7 @@ type statusWriter func(context.Context, *unstructured.Unstructured, UpdateOption
 // the runtime now writes its conditions. withConflict additionally makes the first full-object
 // status write fail with a 409, which is the case the #30 retry handles — and the case where that
 // retry re-applies the stanza captured BEFORE the handler's write.
-func runInterleaving(t *testing.T, write statusWriter, withConflict bool) (out *unstructured.Unstructured, updatesN, patchesN, conflictsN int) {
+func runInterleaving(t *testing.T, write statusWriter, withConflict bool) (out *unstructured.Unstructured, updatesN, patchesN, conflictsN int, writeErr error) {
 	t.Helper()
 
 	client := fake.NewSimpleDynamicClient(scheme.Scheme, liveWithHandlerInventory())
@@ -109,18 +110,16 @@ func runInterleaving(t *testing.T, write statusWriter, withConflict bool) (out *
 		t.Fatal("the runtime's object must NOT carry the handler's inventory, or this proves nothing")
 	}
 
-	if _, err := write(context.Background(), el, UpdateOptions{
+	_, writeErr = write(context.Background(), el, UpdateOptions{
 		Pluralizer:    &mockPluralizer{gvr: cmGVR},
 		DynamicClient: client,
-	}); err != nil {
-		t.Fatalf("the write failed: %v", err)
-	}
+	})
 
 	got, err := client.Resource(cmGVR).Namespace("default").Get(context.Background(), "test-cm", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("reading the object back: %v", err)
 	}
-	return got, updates, patches, *conflicts
+	return got, updates, patches, *conflicts, writeErr
 }
 
 // THE DIFFERENTIAL. The same interleaving is played through both writers. It must destroy
@@ -140,6 +139,7 @@ func TestStatusWrite_SiblingFieldSurvival_Differential(t *testing.T) {
 		wantManaged    bool
 		wantUpdates    int
 		wantPatches    int
+		wantConflict   bool
 		becauseItMusnt string
 	}{
 		{
@@ -151,13 +151,18 @@ func TestStatusWrite_SiblingFieldSurvival_Differential(t *testing.T) {
 			becauseItMusnt: "a full-stanza write expresses the ABSENCE of status.managed (#33)",
 		},
 		{
-			name:           "UpdateStatus destroys it through the conflict retry too",
+			// THIS ROW USED TO SAY "UpdateStatus destroys it through the conflict retry too": on a 409
+			// the retry re-applied the stale stanza and wiped the inventory (#30 widened #33). That is
+			// core-provider#359's lost update, and it is gone. The 409 is now returned as
+			// ErrStatusConflict, nothing lands, and the handler's inventory survives.
+			name:           "UpdateStatus refuses on conflict instead of overwriting",
 			write:          UpdateStatus,
 			withConflict:   true,
-			wantManaged:    false,
-			wantUpdates:    1, // the counter sits behind the conflict reactor; only the landing write is counted
+			wantManaged:    true,
+			wantUpdates:    0, // the one attempt is refused by the conflict reactor; nothing reaches the tracker
 			wantPatches:    0,
-			becauseItMusnt: "on 409 the retry re-applies the stanza captured BEFORE the handler's write (#30 widened #33)",
+			wantConflict:   true,
+			becauseItMusnt: "re-submitting a stanza computed before the handler's write is the lost update (#359)",
 		},
 		{
 			name:           "PatchStatusConditions preserves it",
@@ -169,13 +174,19 @@ func TestStatusWrite_SiblingFieldSurvival_Differential(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			out, updates, patches, conflicts := runInterleaving(t, tc.write, tc.withConflict)
+			out, updates, patches, conflicts, writeErr := runInterleaving(t, tc.write, tc.withConflict)
 
-			// CALIBRATION for the retry arm: if the fake never produced a 409, that arm says nothing
-			// about the retry path and would pass against code with no retry at all.
-			if tc.withConflict && conflicts < 2 {
-				t.Fatalf("the fake never produced a conflict (%d status writes seen by its reactor), "+
-					"so the retry path was not exercised", conflicts)
+			// CALIBRATION for the conflict arm: if the fake never produced a 409, that arm says nothing
+			// about conflict handling and would pass against a write that simply landed.
+			if tc.withConflict && conflicts != 1 {
+				t.Fatalf("want exactly one status write, refused with a conflict; the fake's reactor saw %d", conflicts)
+			}
+			if tc.wantConflict {
+				if !errors.Is(writeErr, ErrStatusConflict) {
+					t.Fatalf("want ErrStatusConflict, got %v", writeErr)
+				}
+			} else if writeErr != nil {
+				t.Fatalf("the write failed: %v", writeErr)
 			}
 
 			_, gotManaged, err := unstructured.NestedSlice(out.Object, "status", "managed")
@@ -195,6 +206,9 @@ func TestStatusWrite_SiblingFieldSurvival_Differential(t *testing.T) {
 
 			// The runtime's own field must still land, whichever writer did it; otherwise "the
 			// sibling survived" would be satisfied by a writer that did nothing.
+			if tc.wantConflict {
+				return // nothing landed by design; the inventory check above is the point of this arm
+			}
 			conds, found, _ := unstructured.NestedSlice(out.Object, "status", "conditions")
 			if !found || len(conds) == 0 {
 				t.Fatal("the conditions the runtime wrote must land")

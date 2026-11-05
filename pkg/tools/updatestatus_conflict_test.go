@@ -2,9 +2,11 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -52,32 +54,58 @@ func conflictOnce(c *fake.FakeDynamicClient) *int {
 	return &calls
 }
 
-// THE CASE THE FIX EXISTS FOR. A conflict on the first attempt must be retried and the intended
-// status must land -- NOT be returned to the caller, which records it on the object as a
-// ReconcileError and so turns a transient race into a permanent error condition (#30).
-func TestUpdateStatus_RetriesOnConflictAndLandsTheStatus(t *testing.T) {
-	client := fake.NewSimpleDynamicClient(scheme.Scheme, cmWithStatus("1", nil))
+// #359. A conflict means the caller's status was computed from a stale read. It must come back as
+// ErrStatusConflict (and still satisfy apierrors.IsConflict), and must NOT be re-submitted: the
+// newer write on the server, including a field the stale caller never saw, has to survive. The
+// test this replaces asserted the opposite ("the intended status must land"), which is the lost
+// update that wiped status.managed on a snowplow bench cluster.
+func TestUpdateStatus_ConflictIsReturnedTypedAndNotResubmitted(t *testing.T) {
+	live := cmWithStatus("2", map[string]any{"marker": "newer", "managed": []any{"child"}})
+	client := fake.NewSimpleDynamicClient(scheme.Scheme, live)
 	calls := conflictOnce(client)
 
-	in := cmWithStatus("1", map[string]any{"phase": "Ready"})
-	out, err := UpdateStatus(context.Background(), in, UpdateOptions{
-		Pluralizer:    &mockPluralizer{gvr: cmGVR},
-		DynamicClient: client,
+	stale := cmWithStatus("1", map[string]any{"marker": "stale"})
+	_, err := UpdateStatus(context.Background(), stale,
+		UpdateOptions{Pluralizer: &mockPluralizer{gvr: cmGVR}, DynamicClient: client})
+	if !errors.Is(err, ErrStatusConflict) {
+		t.Fatalf("want ErrStatusConflict, got %v", err)
+	}
+	if !apierrors.IsConflict(err) {
+		t.Errorf("the apiserver's conflict must stay matchable alongside the sentinel: %v", err)
+	}
+	if *calls != 1 {
+		t.Fatalf("the stale status was re-submitted after the conflict (%d status writes): the lost update", *calls)
+	}
+	got, gErr := client.Resource(cmGVR).Namespace("default").Get(context.Background(), "test-cm", metav1.GetOptions{})
+	if gErr != nil {
+		t.Fatal(gErr)
+	}
+	if m, _, _ := unstructured.NestedString(got.Object, "status", "marker"); m != "newer" {
+		t.Errorf("the newer status was replaced: marker=%q", m)
+	}
+	if managed, found, _ := unstructured.NestedSlice(got.Object, "status", "managed"); !found || len(managed) != 1 {
+		t.Errorf("a field written by the newer pass was removed (found=%v, %v)", found, managed)
+	}
+}
+
+// CONTROL: without a conflict the status lands in one write, so the test above is about the 409 and
+// not about a write that never happens.
+func TestUpdateStatus_NoConflictLandsInOneWrite(t *testing.T) {
+	client := fake.NewSimpleDynamicClient(scheme.Scheme, cmWithStatus("1", nil))
+	calls := 0
+	client.PrependReactor("update", "configmaps", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if ua, ok := a.(k8stesting.UpdateAction); ok && ua.GetSubresource() == "status" {
+			calls++
+		}
+		return false, nil, nil
 	})
-	if err != nil {
-		t.Fatalf("a conflict must be retried, not returned: %v", err)
+	out, err := UpdateStatus(context.Background(), cmWithStatus("1", map[string]any{"marker": "fresh"}),
+		UpdateOptions{Pluralizer: &mockPluralizer{gvr: cmGVR}, DynamicClient: client})
+	if err != nil || calls != 1 {
+		t.Fatalf("want one successful write, got err=%v writes=%d", err, calls)
 	}
-
-	// CALIBRATION. If the reactor never fired, this test proves nothing about conflicts -- it would
-	// pass against the unfixed code too. Printing the denominator next to the result is the point.
-	if *calls < 2 {
-		t.Fatalf("the fake never produced a conflict (UpdateStatus called %d times), so this test "+
-			"could not have distinguished the fix from its absence", *calls)
-	}
-
-	phase, found, _ := unstructured.NestedString(out.Object, "status", "phase")
-	if !found || phase != "Ready" {
-		t.Errorf("the intended status must survive the retry, got phase=%q found=%v", phase, found)
+	if m, _, _ := unstructured.NestedString(out.Object, "status", "marker"); m != "fresh" {
+		t.Errorf("marker = %q, want fresh", m)
 	}
 }
 
@@ -106,58 +134,5 @@ func TestUpdateStatus_NonConflictErrorIsReturnedNotRetried(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Errorf("a non-conflict error must not be retried, got %d attempts", calls)
-	}
-}
-
-// A status write must not revert metadata somebody else changed in the meantime. The retry re-reads
-// the live object and puts only the status onto it, so a label added between the fetch and the
-// retry survives -- the alternative, re-sending the caller's whole stale object, would silently
-// undo another writer's metadata.
-// The foreign label is PRE-SEEDED on the live object rather than written from inside the reactor.
-// Writing to the fake client from within its own reactor re-enters the tracker's lock and
-// deadlocks -- this test hung for 600s before being restructured, which is a defect in the test and
-// not in the code under test. Pre-seeding is also the state that matters: the caller's `el` lacks
-// the label, the live object has it, and the retried write must not revert it.
-func TestUpdateStatus_RetryDoesNotRevertForeignMetadata(t *testing.T) {
-	live := cmWithStatus("1", nil)
-	live.SetLabels(map[string]string{"written-by": "someone-else"})
-	client := fake.NewSimpleDynamicClient(scheme.Scheme, live)
-	calls := conflictOnce(client)
-
-	// The caller's object carries NO label -- it was fetched before the other writer landed.
-	out, err := UpdateStatus(context.Background(), cmWithStatus("1", map[string]any{"phase": "Ready"}),
-		UpdateOptions{Pluralizer: &mockPluralizer{gvr: cmGVR}, DynamicClient: client})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if *calls < 2 {
-		t.Fatalf("the fake never produced a conflict (%d attempts), so nothing was exercised", *calls)
-	}
-	if got := out.GetLabels()["written-by"]; got != "someone-else" {
-		t.Errorf("a status write must not revert another writer's metadata, label = %q", got)
-	}
-	if phase, _, _ := unstructured.NestedString(out.Object, "status", "phase"); phase != "Ready" {
-		t.Errorf("the intended status must still land, phase = %q", phase)
-	}
-}
-
-// Removal must stay possible. A caller passing an object with NO status is asking for the status to
-// be cleared, and a field-by-field merge on retry would make that unexpressible -- which is why the
-// retry replaces the stanza rather than merging it.
-func TestUpdateStatus_RetryPreservesStatusRemoval(t *testing.T) {
-	client := fake.NewSimpleDynamicClient(scheme.Scheme,
-		cmWithStatus("1", map[string]any{"phase": "Ready"}))
-	calls := conflictOnce(client)
-
-	out, err := UpdateStatus(context.Background(), cmWithStatus("1", nil),
-		UpdateOptions{Pluralizer: &mockPluralizer{gvr: cmGVR}, DynamicClient: client})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if *calls < 2 {
-		t.Fatalf("the fake never produced a conflict (%d attempts), so nothing was exercised", *calls)
-	}
-	if _, found, _ := unstructured.NestedMap(out.Object, "status"); found {
-		t.Error("a caller passing no status is clearing it; the retry must not resurrect the live one")
 	}
 }

@@ -138,12 +138,24 @@ func (c *Controller) recordMetric(evt ctrlevent.Event, operation string, err err
 	).Inc()
 }
 
+// statusConflict reports a pass that ended because its status write lost a race to a newer write
+// (tools.ErrStatusConflict, core-provider#359). It is NOT a failure. The pass computed its status
+// from a read the conflict proved stale, so the right response is to recompute, not to record an
+// error. It is handled like a deferral: no ReconcileError, no event, no failure metric, no
+// maxRetries budget spent, and a prompt requeue so the next pass reads the newer write.
+func statusConflict(err error) bool { return errors.Is(err, tools.ErrStatusConflict) }
+
+// statusConflictRequeue is how soon a pass that lost a status race runs again. Short, because nothing
+// is wrong: the object just changed under it.
+const statusConflictRequeue = time.Second
+
 // passOutcome is how a pass is COUNTED, which is a separate question from how it is requeued.
 type passOutcome int
 
 const (
 	outcomeSuccess passOutcome = iota
 	outcomeDeferred
+	outcomeStatusConflict
 	outcomeFailure
 )
 
@@ -158,6 +170,8 @@ func classifyOutcome(err error) passOutcome {
 		return outcomeSuccess
 	case errors.As(err, &deferred):
 		return outcomeDeferred
+	case statusConflict(err):
+		return outcomeStatusConflict
 	default:
 		return outcomeFailure
 	}
@@ -231,7 +245,7 @@ func (c *Controller) runWorker(ctx context.Context) {
 			switch classifyOutcome(err) {
 			case outcomeSuccess:
 				c.metrics.IncReconcileSuccess(ctx)
-			case outcomeDeferred:
+			case outcomeDeferred, outcomeStatusConflict:
 				c.metrics.IncReconcileRequeueAfter(ctx)
 			default:
 				c.metrics.IncReconcileFailure(ctx)
@@ -319,6 +333,26 @@ func (c *Controller) handleErr(err error, obj ctrlevent.Event, priority int) {
 			c.items.Store(dig, struct{}{})
 			c.queue.AddWithOpts(priorityqueue.AddOpts{
 				After:       deferred.After,
+				RateLimited: false,
+				Priority:    priority,
+			}, obj)
+		}
+		return
+	}
+
+	// A LOST STATUS RACE IS REQUEUED QUIETLY, also ahead of the maxRetries check, for the same reasons
+	// as a deferral: it says nothing about the item, so it must not grow the item's backoff or spend
+	// its retry budget (core-provider#359).
+	if statusConflict(err) {
+		retryEvent := obj
+		if retryEvent.QueuedAt.IsZero() {
+			retryEvent.QueuedAt = time.Now()
+		}
+		dig := ctrlevent.DigestForEvent(retryEvent)
+		if _, loaded := c.items.Load(dig); !loaded {
+			c.items.Store(dig, struct{}{})
+			c.queue.AddWithOpts(priorityqueue.AddOpts{
+				After:       statusConflictRequeue,
 				RateLimited: false,
 				Priority:    priority,
 			}, obj)
@@ -525,6 +559,10 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 			//
 			// The condition matters most of the three: charts and gates read a CR condition, not
 			// our logs. It keeps the existing remediation advice and adds the cause.
+			if statusConflict(obsErr) {
+				lg.Debug("Status write lost a race to a newer write; requeueing to recompute", "error", obsErr.Error())
+				return obsErr
+			}
 			wrapped := fmt.Errorf("%s: %w", errCreateIncomplete, obsErr)
 			lg.Warn(errCreateIncomplete, "error", obsErr.Error())
 			c.recordEvent(el, event.Warning(reasonCannotInitialize, actionProcessEvent, wrapped))
@@ -836,6 +874,11 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 		}
 	}
 	if actionErr != nil {
+		// A lost status race is not an error: requeue quietly, record nothing (#359).
+		if statusConflict(actionErr) {
+			log.Debug("Status write lost a race to a newer write; requeueing to recompute", "error", actionErr.Error())
+			return actionErr
+		}
 		c.recordEvent(el, event.Warning(reasonCannotObserve, actionObserveExternalResource, actionErr))
 		log.Error(actionErr, "Cannot observe external resource")
 
@@ -1124,6 +1167,11 @@ func (c *Controller) handleCreate(ctx context.Context, ref objectref.ObjectRef) 
 		}
 	}
 	if actionErr != nil {
+		// A lost status race is not an error: requeue quietly, record nothing (#359).
+		if statusConflict(actionErr) {
+			log.Debug("Status write lost a race to a newer write; requeueing to recompute", "error", actionErr.Error())
+			return actionErr
+		}
 		c.recordEvent(el, event.Warning(reasonCannotCreate, actionCreateExternalResource, actionErr))
 		log.Error(actionErr, "Cannot create external resource")
 		el, err := c.fetch(ctx, ref, false)
@@ -1256,6 +1304,11 @@ func (c *Controller) handleUpdate(ctx context.Context, ref objectref.ObjectRef) 
 		}
 	}
 	if actionErr != nil {
+		// A lost status race is not an error: requeue quietly, record nothing (#359).
+		if statusConflict(actionErr) {
+			log.Debug("Status write lost a race to a newer write; requeueing to recompute", "error", actionErr.Error())
+			return actionErr
+		}
 		c.recordEvent(el, event.Warning(reasonCannotUpdate, actionUpdateEvent, actionErr))
 		log.Error(actionErr, "Cannot update external resource")
 		e, err := c.fetch(ctx, ref, false)
@@ -1331,6 +1384,11 @@ func (c *Controller) handleDelete(ctx context.Context, ref objectref.ObjectRef) 
 		}
 	}
 	if actionErr != nil {
+		// A lost status race is not an error: requeue quietly, record nothing (#359).
+		if statusConflict(actionErr) {
+			log.Debug("Status write lost a race to a newer write; requeueing to recompute", "error", actionErr.Error())
+			return actionErr
+		}
 		log.Error(actionErr, "Cannot delete external resource")
 		c.recordEvent(el, event.Warning(reasonCannotDelete, actionDeleteExternalResource, actionErr))
 
