@@ -64,11 +64,11 @@ func New[T comparable](name string, o ...Opt[T]) PriorityQueue[T] {
 	}
 
 	pq := &priorityqueue[T]{
-		log:         opts.Log,
-		items:       map[T]*item[T]{},
-		queue:       btree.NewG(32, less[T]),
-		becameReady: sets.Set[T]{},
-		metrics:     newQueueMetrics[T](opts.MetricProvider, name, clock.RealClock{}),
+		log:          opts.Log,
+		items:        map[T]*item[T]{},
+		queue:        btree.NewG(32, less[T]),
+		blockForever: make(chan time.Time),
+		metrics:      newQueueMetrics[T](opts.MetricProvider, name, clock.RealClock{}),
 		// itemOrWaiterAdded indicates that an item or
 		// waiter was added. It must be buffered, because
 		// if we currently process items we can't tell
@@ -95,7 +95,6 @@ func New[T comparable](name string, o ...Opt[T]) PriorityQueue[T] {
 type priorityqueue[T comparable] struct {
 	log logging.Logger
 	// lock has to be acquired for any access any of items, queue, addedCounter
-	// or becameReady
 	lock  sync.Mutex
 	items map[T]*item[T]
 	queue bTree[*item[T]]
@@ -104,11 +103,9 @@ type priorityqueue[T comparable] struct {
 	// because unixNano is not guaranteed to be unique.
 	addedCounter uint64
 
-	// becameReady holds items that are in the queue, were added
-	// with non-zero after and became ready. We need it to call the
-	// metrics add exactly once for them.
-	becameReady sets.Set[T]
-	metrics     queueMetrics[T]
+	// blockForever is the wake-up channel when no delay is pending: nothing ever sends on it.
+	blockForever chan time.Time
+	metrics      queueMetrics[T]
 
 	itemOrWaiterAdded chan struct{}
 
@@ -178,14 +175,14 @@ func (w *priorityqueue[T]) AddWithOpts(o AddOpts, items ...T) {
 		item, _ := w.queue.Delete(w.items[key])
 		if o.Priority > item.Priority {
 			// Update depth metric only if the item in the queue was already added to the depth metric.
-			if item.ReadyAt == nil || w.becameReady.Has(key) {
+			if item.ReadyAt == nil {
 				w.metrics.updateDepthWithPriorityMetric(item.Priority, o.Priority)
 			}
 			item.Priority = o.Priority
 		}
 
 		if item.ReadyAt != nil && (readyAt == nil || readyAt.Before(*item.ReadyAt)) {
-			if readyAt == nil && !w.becameReady.Has(key) {
+			if readyAt == nil {
 				w.metrics.add(key, item.Priority)
 			}
 			item.ReadyAt = readyAt
@@ -207,9 +204,7 @@ func (w *priorityqueue[T]) notifyItemOrWaiterAdded() {
 }
 
 func (w *priorityqueue[T]) spin() {
-	blockForever := make(chan time.Time)
-	var nextReady <-chan time.Time
-	nextReady = blockForever
+	var nextReady <-chan time.Time = w.blockForever
 
 	for {
 		select {
@@ -219,8 +214,6 @@ func (w *priorityqueue[T]) spin() {
 		case <-nextReady:
 		}
 
-		nextReady = blockForever
-
 		func() {
 			w.lock.Lock()
 			defer w.lock.Unlock()
@@ -228,25 +221,15 @@ func (w *priorityqueue[T]) spin() {
 			w.lockedLock.Lock()
 			defer w.lockedLock.Unlock()
 
+			nextReady = w.promoteDueItems()
+
 			// manipulating the tree from within Ascend might lead to panics, so
 			// track what we want to delete and do it after we are done ascending.
 			var toDelete []*item[T]
 			w.queue.Ascend(func(item *item[T]) bool {
-				if item.ReadyAt != nil {
-					if readyAt := item.ReadyAt.Sub(w.now()); readyAt > 0 {
-						nextReady = w.tick(readyAt)
-						return false
-					}
-					if !w.becameReady.Has(item.Key) {
-						w.metrics.add(item.Key, item.Priority)
-						w.becameReady.Insert(item.Key)
-					}
-				}
-
-				if w.waiters.Load() == 0 {
-					// Have to keep iterating here to ensure we update metrics
-					// for further items that became ready and set nextReady.
-					return true
+				// Delayed items sort last, so this is the end of what can be handed out.
+				if item.ReadyAt != nil || w.waiters.Load() == 0 {
+					return false
 				}
 
 				// Item is locked, we can not hand it out
@@ -260,7 +243,6 @@ func (w *priorityqueue[T]) spin() {
 				w.waiters.Add(-1)
 				delete(w.items, item.Key)
 				toDelete = append(toDelete, item)
-				w.becameReady.Delete(item.Key)
 				// The hand-off is made selectable on w.done: a parked worker in GetWithPriority
 				// now also selects on w.done, so on shutdown it may wake there instead of
 				// receiving this item. A bare blocking send would then wedge forever while this
@@ -282,6 +264,46 @@ func (w *priorityqueue[T]) spin() {
 			}
 		}()
 	}
+}
+
+// promoteDueItems turns every item whose delay has passed into an ordinary queued item, and returns
+// the channel that fires when the next delay does.
+//
+// A DELAY HOLDS AN ITEM BACK UNTIL IT EXPIRES, AND NO LONGER. Delayed items sort behind undelayed ones
+// so the walk can stop at the first that is not due. An expired item used to keep its ReadyAt and so
+// its place behind them, whatever its priority, and it was reached only when nothing else was queued.
+// In a controller whose resync demand exceeds its capacity the queue never empties, so it was never
+// reached: the requeue of a lost status race, every rate-limited retry and every deferral starved. The
+// digest they left stored then made each later resync of that object a duplicate, and the object went
+// silent until a restart, with no error and every condition green.
+//
+// Callers must hold w.lock.
+func (w *priorityqueue[T]) promoteDueItems() <-chan time.Time {
+	var next <-chan time.Time = w.blockForever
+	var due []*item[T]
+	w.queue.Ascend(func(item *item[T]) bool {
+		if item.ReadyAt == nil {
+			return true
+		}
+		if remaining := item.ReadyAt.Sub(w.now()); remaining > 0 {
+			next = w.tick(remaining)
+			return false
+		}
+		due = append(due, item)
+		return true
+	})
+
+	// The b-tree orders on ReadyAt, so an item cannot change it in place.
+	for _, item := range due {
+		w.queue.Delete(item)
+		item.ReadyAt = nil
+		// It joins its priority's queue now, so items come out in the order they became due.
+		item.AddedCounter = w.addedCounter
+		w.addedCounter++
+		w.queue.ReplaceOrInsert(item)
+		w.metrics.add(item.Key, item.Priority)
+	}
+	return next
 }
 
 func (w *priorityqueue[T]) Add(item T) {
