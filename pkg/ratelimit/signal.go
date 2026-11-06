@@ -120,6 +120,21 @@ const (
 	DeferRamping DeferReason = "Ramping"
 )
 
+// Cause is the reason's telemetry value, the same one provider-runtime reports.
+func (r DeferReason) Cause() string {
+	switch r {
+	case DeferThrottled:
+		return "throttled"
+	case DeferAtCapacity:
+		return "capacity"
+	case DeferSaturated:
+		return "saturated"
+	case DeferRamping:
+		return "ramping"
+	}
+	return string(r)
+}
+
 // Deferral says a call must not be made now.
 type Deferral struct {
 	Key    string
