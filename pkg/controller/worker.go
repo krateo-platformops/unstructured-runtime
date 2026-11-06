@@ -804,7 +804,7 @@ func (c *Controller) deferPass(ctx context.Context, el *unstructured.Unstructure
 
 	// Before every branch below: the quiet ramp writes nothing on the object, so this counter is the
 	// only record that it happened.
-	c.metrics.IncRateLimitDeferred(ctx, string(d.Reason))
+	c.metrics.IncRateLimitDeferral(ctx, d.Key, d.Reason)
 
 	after := c.governor.RequeueAfter(d)
 	// THE QUIET RAMP (#66, provider-runtime's first trap). The startup ramp is a planned slow start

@@ -59,7 +59,7 @@ type Metrics struct {
 	saturationInput        metric.Float64ObservableGauge
 	saturationInputEnabled metric.Int64ObservableGauge
 	saturationSource       atomic.Pointer[SaturationSource]
-	rateLimitDeferred      metric.Int64Counter
+	rateLimitDeferrals     metric.Int64Counter
 
 	reconcileSuccess          metric.Int64Counter
 	reconcileFailure          metric.Int64Counter
@@ -294,8 +294,8 @@ func newMetrics(meter metric.Meter, log logging.Logger, deploymentName string) (
 		metric.WithDescription("1 when the saturation input is read, 0 when it is disabled (no cgroup v2, no PSI).")); err != nil {
 		return nil, err
 	}
-	if m.rateLimitDeferred, err = meter.Int64Counter("unstructured_runtime.ratelimit.deferred",
-		metric.WithDescription("Reconcile passes deferred by the governor, by reason. Counts the quiet startup ramp too, which writes nothing on the object.")); err != nil {
+	if m.rateLimitDeferrals, err = meter.Int64Counter("unstructured_runtime.ratelimit.deferrals",
+		metric.WithDescription("Reconcile passes deferred by the governor, by key and cause. Counts the quiet startup ramp too, which writes nothing on the object.")); err != nil {
 		return nil, err
 	}
 
@@ -354,13 +354,14 @@ func (m *Metrics) observeSaturation(observer metric.Observer) {
 	observer.ObserveFloat64(m.saturationInput, in.Percent, metric.WithAttributes(attrs...))
 }
 
-// IncRateLimitDeferred counts one deferred reconcile pass.
-func (m *Metrics) IncRateLimitDeferred(ctx context.Context, reason string) {
+// IncRateLimitDeferral counts one deferred reconcile pass for key. The name and attributes match
+// provider-runtime's, so one dashboard reads both runtimes. key is empty for a local deferral.
+func (m *Metrics) IncRateLimitDeferral(ctx context.Context, key string, reason ratelimit.DeferReason) {
 	if m == nil {
 		return
 	}
-	attrs := append(m.instanceAttrs(), attribute.String("reason", reason))
-	m.rateLimitDeferred.Add(ctx, 1, metric.WithAttributes(attrs...))
+	attrs := append(m.instanceAttrs(), attribute.String("key", key), attribute.String("cause", reason.Cause()))
+	m.rateLimitDeferrals.Add(ctx, 1, metric.WithAttributes(attrs...))
 }
 
 // instanceAttrs returns metric attributes for instance identification.

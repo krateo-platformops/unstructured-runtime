@@ -24,19 +24,19 @@ func meteredForTest(t *testing.T) (*telemetry.Metrics, *sdkmetric.ManualReader) 
 	return m, reader
 }
 
-func deferredByReason(t *testing.T, reader *sdkmetric.ManualReader) map[string]int64 {
+func deferredByCause(t *testing.T, reader *sdkmetric.ManualReader) map[string]int64 {
 	t.Helper()
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(context.Background(), &rm))
 	got := map[string]int64{}
 	for _, scope := range rm.ScopeMetrics {
 		for _, md := range scope.Metrics {
-			if md.Name != "unstructured_runtime.ratelimit.deferred" {
+			if md.Name != "unstructured_runtime.ratelimit.deferrals" {
 				continue
 			}
 			for _, dp := range md.Data.(metricdata.Sum[int64]).DataPoints {
-				reason, _ := dp.Attributes.Value(attribute.Key("reason"))
-				got[reason.AsString()] = dp.Value
+				cause, _ := dp.Attributes.Value(attribute.Key("cause"))
+				got[cause.AsString()] = dp.Value
 			}
 		}
 	}
@@ -57,7 +57,7 @@ func TestSaturation_TheQuietRampIsCounted(t *testing.T) {
 	var de *ratelimit.DeferredError
 	require.True(t, errors.As(err, &de), "want a deferral, got %v", err)
 	require.Equal(t, ratelimit.DeferRamping, de.Deferral.Reason)
-	require.Equal(t, map[string]int64{"Ramping": 1}, deferredByReason(t, reader))
+	require.Equal(t, map[string]int64{"ramping": 1}, deferredByCause(t, reader))
 }
 
 // A saturating governor must reach the gauges through New, the way a real controller is built.

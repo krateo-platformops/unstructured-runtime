@@ -2,6 +2,7 @@ package telemetry
 
 import (
 	"context"
+	"reflect"
 	"testing"
 
 	"github.com/krateo-platformops/unstructured-runtime/pkg/logging"
@@ -15,7 +16,7 @@ const (
 	capacityMetric = "unstructured_runtime.ratelimit.local.capacity"
 	inputMetric    = "unstructured_runtime.ratelimit.saturation.input"
 	enabledMetric  = "unstructured_runtime.ratelimit.saturation.input.enabled"
-	deferredMetric = "unstructured_runtime.ratelimit.deferred"
+	deferredMetric = "unstructured_runtime.ratelimit.deferrals"
 )
 
 type fakeSource struct {
@@ -117,12 +118,15 @@ func TestSaturation_DisabledInputReportsNoPercent(t *testing.T) {
 	}
 }
 
-func TestRateLimitDeferred_CountsByReason(t *testing.T) {
+// The values are provider-runtime's, so one dashboard reads both runtimes.
+func TestRateLimitDeferrals_CountByCause(t *testing.T) {
 	rm := collect(t, func(m *Metrics) {
 		ctx := context.Background()
-		m.IncRateLimitDeferred(ctx, string(ratelimit.DeferRamping))
-		m.IncRateLimitDeferred(ctx, string(ratelimit.DeferRamping))
-		m.IncRateLimitDeferred(ctx, string(ratelimit.DeferSaturated))
+		m.IncRateLimitDeferral(ctx, "", ratelimit.DeferRamping)
+		m.IncRateLimitDeferral(ctx, "", ratelimit.DeferRamping)
+		m.IncRateLimitDeferral(ctx, "", ratelimit.DeferSaturated)
+		m.IncRateLimitDeferral(ctx, "api.example.com", ratelimit.DeferThrottled)
+		m.IncRateLimitDeferral(ctx, "api.example.com", ratelimit.DeferAtCapacity)
 	})
 
 	got := map[string]int64{}
@@ -132,18 +136,23 @@ func TestRateLimitDeferred_CountsByReason(t *testing.T) {
 				continue
 			}
 			for _, dp := range md.Data.(metricdata.Sum[int64]).DataPoints {
-				reason, _ := dp.Attributes.Value(attribute.Key("reason"))
-				got[reason.AsString()] = dp.Value
+				cause, _ := dp.Attributes.Value(attribute.Key("cause"))
+				key, _ := dp.Attributes.Value(attribute.Key("key"))
+				got[key.AsString()+"/"+cause.AsString()] = dp.Value
 			}
 		}
 	}
-	if got["Ramping"] != 2 || got["Saturated"] != 1 || len(got) != 2 {
-		t.Fatalf("deferred by reason = %v, want Ramping:2 Saturated:1", got)
+	want := map[string]int64{
+		"/ramping": 2, "/saturated": 1,
+		"api.example.com/throttled": 1, "api.example.com/capacity": 1,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("deferrals = %v, want %v", got, want)
 	}
 }
 
 func TestSaturationMetrics_NilReceiverIsSafe(t *testing.T) {
 	var m *Metrics
 	m.SetSaturationSource(fakeSource{capacity: 1})
-	m.IncRateLimitDeferred(context.Background(), "Ramping")
+	m.IncRateLimitDeferral(context.Background(), "", ratelimit.DeferRamping)
 }
