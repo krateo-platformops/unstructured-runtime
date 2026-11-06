@@ -218,6 +218,14 @@ var (
 	)
 )
 
+// wireSaturationMetrics points the saturation gauges at a governor that can report them. A governor
+// with saturation off still satisfies the interface; the gauges then report nothing.
+func wireSaturationMetrics(m *telemetry.Metrics, g ratelimit.Governor) {
+	if src, ok := g.(telemetry.SaturationSource); ok {
+		m.SetSaturationSource(src)
+	}
+}
+
 func init() {
 	prometheus.MustRegister(reconcileTotal)
 	prometheus.MustRegister(reconcileDuration)
@@ -560,6 +568,8 @@ func New(sid *shortid.Shortid, opts Options) (*Controller, error) {
 	if opts.GracefulShutdownTimeout != nil {
 		gracefulShutdownTimeout = *opts.GracefulShutdownTimeout
 	}
+
+	wireSaturationMetrics(opts.Metrics, opts.RateLimitGovernor)
 
 	return &Controller{
 		dynamicClient:           opts.Client,

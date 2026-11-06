@@ -802,6 +802,10 @@ func (c *Controller) acquireRateLimit(ctx context.Context, el *unstructured.Unst
 func (c *Controller) deferPass(ctx context.Context, el *unstructured.Unstructured, d *ratelimit.Deferral) error {
 	log := contextutils.Logger(ctx).WithValues("rateLimitKey", d.Key, "reason", string(d.Reason))
 
+	// Before every branch below: the quiet ramp writes nothing on the object, so this counter is the
+	// only record that it happened.
+	c.metrics.IncRateLimitDeferred(ctx, string(d.Reason))
+
 	after := c.governor.RequeueAfter(d)
 	// THE QUIET RAMP (#66, provider-runtime's first trap). The startup ramp is a planned slow start
 	// that clears itself; writing Synced=False for it would make a restart with N objects write N

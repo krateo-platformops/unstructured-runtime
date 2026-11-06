@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/krateo-platformops/unstructured-runtime/pkg/logging"
+	"github.com/krateo-platformops/unstructured-runtime/pkg/ratelimit"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
@@ -53,6 +54,12 @@ type Metrics struct {
 	queueWorkDuration      metric.Float64Histogram
 	reconcileInFlight      metric.Int64ObservableGauge
 	reconcileInFlightCount atomic.Int64
+
+	localCapacity          metric.Int64ObservableGauge
+	saturationInput        metric.Float64ObservableGauge
+	saturationInputEnabled metric.Int64ObservableGauge
+	saturationSource       atomic.Pointer[SaturationSource]
+	rateLimitDeferred      metric.Int64Counter
 
 	reconcileSuccess          metric.Int64Counter
 	reconcileFailure          metric.Int64Counter
@@ -164,6 +171,12 @@ func buildResource(cfg Config) (*resource.Resource, error) {
 	return resource.Merge(resource.Default(), resource.NewSchemaless(attrs...))
 }
 
+// NewWithMeter builds Metrics on a caller's meter, for a caller that owns its own provider. Setup is
+// the normal entry point.
+func NewWithMeter(meter metric.Meter, log logging.Logger, deploymentName string) (*Metrics, error) {
+	return newMetrics(meter, log, deploymentName)
+}
+
 func newMetrics(meter metric.Meter, log logging.Logger, deploymentName string) (*Metrics, error) {
 	var err error
 	m := &Metrics{
@@ -268,15 +281,86 @@ func newMetrics(meter metric.Meter, log logging.Logger, deploymentName string) (
 		return nil, err
 	}
 
+	if m.localCapacity, err = meter.Int64ObservableGauge("unstructured_runtime.ratelimit.local.capacity",
+		metric.WithDescription("Current process-wide capacity the controller's own CPU saturation allows. Not reported when saturation gating is off.")); err != nil {
+		return nil, err
+	}
+	if m.saturationInput, err = meter.Float64ObservableGauge("unstructured_runtime.ratelimit.saturation.input",
+		metric.WithDescription("The saturation input's last value: PSI some avg10 for cpu_pressure. Not reported while the input is disabled."),
+		metric.WithUnit("%")); err != nil {
+		return nil, err
+	}
+	if m.saturationInputEnabled, err = meter.Int64ObservableGauge("unstructured_runtime.ratelimit.saturation.input.enabled",
+		metric.WithDescription("1 when the saturation input is read, 0 when it is disabled (no cgroup v2, no PSI).")); err != nil {
+		return nil, err
+	}
+	if m.rateLimitDeferred, err = meter.Int64Counter("unstructured_runtime.ratelimit.deferred",
+		metric.WithDescription("Reconcile passes deferred by the governor, by reason. Counts the quiet startup ramp too, which writes nothing on the object.")); err != nil {
+		return nil, err
+	}
+
 	_, err = meter.RegisterCallback(func(_ context.Context, observer metric.Observer) error {
 		observer.ObserveInt64(m.reconcileInFlight, m.reconcileInFlightCount.Load())
+		m.observeSaturation(observer)
 		return nil
-	}, m.reconcileInFlight)
+	}, m.reconcileInFlight, m.localCapacity, m.saturationInput, m.saturationInputEnabled)
 	if err != nil {
 		return nil, err
 	}
 
 	return m, nil
+}
+
+// SaturationSource is the part of a governor that reports its CPU-saturation state. Optional: a
+// governor that does not implement it simply has none of these series.
+type SaturationSource interface {
+	// LocalCapacity is the process-wide local capacity, or 0 when saturation gating is off.
+	LocalCapacity() int
+	// LocalInput is the saturation input's last reading.
+	LocalInput() ratelimit.InputSnapshot
+}
+
+// SetSaturationSource names the governor the saturation gauges read.
+func (m *Metrics) SetSaturationSource(s SaturationSource) {
+	if m == nil || s == nil {
+		return
+	}
+	m.saturationSource.Store(&s)
+}
+
+// observeSaturation reports the local capacity and its input.
+//
+// SATURATION OFF REPORTS NOTHING, NOT ZERO. LocalCapacity is 0 only when the rule is off, and a
+// series reading 0 would say the controller may run nothing. The same holds for a disabled input:
+// it has no Percent, and 0 would read as a healthy controller. Its state is on the .enabled gauge.
+func (m *Metrics) observeSaturation(observer metric.Observer) {
+	src := m.saturationSource.Load()
+	if src == nil {
+		return
+	}
+	capacity := (*src).LocalCapacity()
+	if capacity <= 0 {
+		return
+	}
+	observer.ObserveInt64(m.localCapacity, int64(capacity), metric.WithAttributes(m.instanceAttrs()...))
+
+	in := (*src).LocalInput()
+	attrs := append(m.instanceAttrs(), attribute.String("input", in.Input))
+	if !in.Enabled {
+		observer.ObserveInt64(m.saturationInputEnabled, 0, metric.WithAttributes(attrs...))
+		return
+	}
+	observer.ObserveInt64(m.saturationInputEnabled, 1, metric.WithAttributes(attrs...))
+	observer.ObserveFloat64(m.saturationInput, in.Percent, metric.WithAttributes(attrs...))
+}
+
+// IncRateLimitDeferred counts one deferred reconcile pass.
+func (m *Metrics) IncRateLimitDeferred(ctx context.Context, reason string) {
+	if m == nil {
+		return
+	}
+	attrs := append(m.instanceAttrs(), attribute.String("reason", reason))
+	m.rateLimitDeferred.Add(ctx, 1, metric.WithAttributes(attrs...))
 }
 
 // instanceAttrs returns metric attributes for instance identification.
