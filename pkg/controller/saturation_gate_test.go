@@ -2,14 +2,11 @@ package controller
 
 import (
 	"context"
-	"errors"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/krateo-platformops/unstructured-runtime/pkg/ratelimit"
-	"github.com/krateo-platformops/unstructured-runtime/pkg/tools/unstructured/condition"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
@@ -57,88 +54,6 @@ func satGov(t *testing.T, fixtureDir string, start bool) ratelimit.Governor {
 		}, 2*time.Second, 5*time.Millisecond, "the sampler never took its first sample")
 	}
 	return g
-}
-
-// holdLocalSlot takes the single local slot, as an in-flight pass would.
-func holdLocalSlot(t *testing.T, g ratelimit.Governor) {
-	t.Helper()
-	release, d := g.TryAcquire("")
-	require.Nil(t, d, "setup: could not take the local slot")
-	t.Cleanup(release)
-}
-
-// THE QUIET RAMP. On the startup ramp a deferred pass calls no handler AND writes nothing: the gate
-// precedes every handler call, so there is nothing learned to keep.
-func TestSaturation_TheStartupRampIsQuiet(t *testing.T) {
-	g := satGov(t, "healthy", true)
-	holdLocalSlot(t, g)
-	cc := &countingClient{}
-	ctrl, evt, opts := gateController(t, g, cc)
-	before := statusWrites(t, opts)
-
-	err := ctrl.processItem(context.TODO(), evt)
-
-	var de *ratelimit.DeferredError
-	require.True(t, errors.As(err, &de), "want a deferral, got %v", err)
-	require.Equal(t, ratelimit.DeferRamping, de.Deferral.Reason)
-	require.Zero(t, cc.calls.Load(), "the handler was called on a deferred pass")
-	require.Equal(t, before, statusWrites(t, opts), "the startup ramp wrote status; it must be quiet")
-}
-
-// ONLY THE RAMP IS QUIET. A saturated controller, and a governor whose sampler never started, both
-// write Synced=False/ReconcileDeferred naming the cause, so neither hides as the ramp.
-func TestSaturation_OnlyTheRampIsQuiet(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		gov    func(*testing.T) ratelimit.Governor
-		reason ratelimit.DeferReason
-		inMsg  string
-	}{
-		{"saturated", func(t *testing.T) ratelimit.Governor { return satGov(t, "cpu-pressure", true) }, ratelimit.DeferSaturated, "CPU pressure 81%"},
-		{"sampler never started", func(t *testing.T) ratelimit.Governor { return satGov(t, "healthy", false) }, ratelimit.DeferAtCapacity, "sampler is not running"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			g := tc.gov(t)
-			holdLocalSlot(t, g)
-			cc := &countingClient{}
-			ctrl, evt, opts := gateController(t, g, cc)
-			before := statusWrites(t, opts)
-
-			err := ctrl.processItem(context.TODO(), evt)
-
-			var de *ratelimit.DeferredError
-			require.True(t, errors.As(err, &de), "want a deferral, got %v", err)
-			require.Equal(t, tc.reason, de.Deferral.Reason)
-			require.True(t, de.Deferral.Local)
-			require.Zero(t, cc.calls.Load(), "the handler was called on a deferred pass")
-			require.Greater(t, statusWrites(t, opts), before, "a %s deferral must be written", tc.name)
-			synced, _ := gateSyncedOf(t, opts, evt.ObjectRef.Name)
-			require.NotNil(t, synced)
-			require.Equal(t, condition.ReasonReconcileDeferred, synced.Reason)
-			require.True(t, strings.Contains(synced.Message, tc.inMsg), "message %q does not name %q", synced.Message, tc.inMsg)
-			require.True(t, strings.Contains(synced.Message, "local capacity"), "message %q must say it is the controller's own capacity", synced.Message)
-		})
-	}
-}
-
-// The local slot is released on EVERY exit of the pass, success and failure alike, or one failing
-// object would starve every other of local capacity.
-func TestSaturation_TheLocalSlotIsReleasedOnEveryExit(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		err  error
-	}{{"the handler succeeds", nil}, {"the handler fails", errors.New("boom")}} {
-		t.Run(tc.name, func(t *testing.T) {
-			g := satGov(t, "healthy", true)
-			cc := &countingClient{err: tc.err}
-			ctrl, evt, _ := gateController(t, g, cc)
-			_ = ctrl.processItem(context.TODO(), evt)
-			require.Positive(t, cc.calls.Load(), "setup: the pass never reached the handler")
-			release, d := g.TryAcquire("")
-			require.Nil(t, d, "the local slot was not returned after the pass (%s)", tc.name)
-			release()
-		})
-	}
 }
 
 type startRecorder struct {

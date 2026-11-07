@@ -378,30 +378,6 @@ func ReconcileDeferred(key string, until time.Time) metav1.Condition {
 	}
 }
 
-// LocalReconcileDeferred returns the Synced condition for a pass the runtime did not make because the
-// controller's OWN local capacity was full (#66): its CPU is saturated, or the capacity has not yet
-// risen back after a cut. The reason is ReconcileDeferred like the rate-limit case, so a gate that
-// already handles deferral needs no change; the message says it is the controller itself, not a
-// server, so nobody goes looking for a remote limit. Ready is not touched, for the same reason as
-// ReconcileDeferred.
-//
-// cause is the saturated reading, the unstarted-sampler explanation, or empty when the capacity is
-// simply full and recovering.
-func LocalReconcileDeferred(capacity int, cause string) metav1.Condition {
-	msg := fmt.Sprintf("reconciliation deferred: the controller's own local capacity (%d) is full and "+
-		"rises as its CPU allows; no server limit is involved", capacity)
-	if cause != "" {
-		msg = fmt.Sprintf("reconciliation deferred: the controller's own local capacity (%d) is full: %s", capacity, cause)
-	}
-	return metav1.Condition{
-		Type:               TypeSynced,
-		Status:             metav1.ConditionFalse,
-		LastTransitionTime: metav1.Now(),
-		Reason:             ReasonReconcileDeferred,
-		Message:            msg,
-	}
-}
-
 // ReconcilePaused returns a condition that indicates reconciliation on
 // the managed resource is paused via the pause annotation.
 func ReconcilePaused() metav1.Condition {
