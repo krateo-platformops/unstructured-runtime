@@ -43,9 +43,25 @@ func (o *orderClient) seen() []string {
 // fail: every worker popped, found no slot and slept out a deferral, so the high-priority item lost
 // the free slot to whatever was undelayed.
 func TestLocalSlot_HighPriorityRunsNextWhenTheSlotFrees(t *testing.T) {
+	t.Run("bare queue", func(t *testing.T) { highPriorityRunsNext(t, false) })
+	// Production sets Metrics, and then the controller wraps the queue in InstrumentedQueue. A wrapper
+	// that dropped AddOpts or the priority would make every item equal while the bare run still passed.
+	t.Run("instrumented queue, as production builds it", func(t *testing.T) { highPriorityRunsNext(t, true) })
+}
+
+func highPriorityRunsNext(t *testing.T, metered bool) {
 	g := satGov(t, "healthy", false) // sampler unstarted: capacity stays at exactly 1
 	oc := &orderClient{gate: make(chan struct{})}
-	ctrl, _, opts := gateController(t, g, oc)
+	var ctrl *Controller
+	var opts Options
+	if metered {
+		ctrl, _, opts = gateControllerWith(t, g, oc, func(o *Options) { o.Metrics, _ = meteredForTest(t) })
+		if _, ok := ctrl.queue.(*InstrumentedQueue[any]); !ok {
+			t.Fatalf("setup: the queue is %T, not the instrumented one production uses", ctrl.queue)
+		}
+	} else {
+		ctrl, _, opts = gateController(t, g, oc)
+	}
 	for _, n := range []string{"first", "low-1", "low-2", "high"} {
 		_, err := opts.Client.Resource(opts.GVR).Namespace(opts.Namespace).
 			Create(context.TODO(), createTestUnstructured(n, opts.Namespace), metav1.CreateOptions{})

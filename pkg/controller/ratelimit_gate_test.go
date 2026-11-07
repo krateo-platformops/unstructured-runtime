@@ -44,10 +44,19 @@ func (k *keyedClient) RateLimitKey(*unstructured.Unstructured) (string, error) {
 
 func gateController(t *testing.T, gov ratelimit.Governor, ec ExternalClient) (*Controller, ctrlevent.Event, Options) {
 	t.Helper()
+	return gateControllerWith(t, gov, ec, nil)
+}
+
+// gateControllerWith is gateController with a hook to change the options before New builds the queue.
+func gateControllerWith(t *testing.T, gov ratelimit.Governor, ec ExternalClient, mutate func(*Options)) (*Controller, ctrlevent.Event, Options) {
+	t.Helper()
 	sid, err := shortid.New(1, shortid.DefaultABC, 2342)
 	require.NoError(t, err)
 	opts := createTestOptions()
 	opts.RateLimitGovernor = gov
+	if mutate != nil {
+		mutate(&opts)
+	}
 	// createTestOptions leaves MaxRetries at zero, and handleErr DROPS a failure when
 	// NumRequeues >= maxRetries — so with zero every real failure is dropped before it reaches the
 	// queue, and no test here could tell a deferral from a failure. The builder's default is 5;
