@@ -122,9 +122,7 @@ func TestSaturation_DisabledInputReportsNoPercent(t *testing.T) {
 func TestRateLimitDeferrals_CountByCause(t *testing.T) {
 	rm := collect(t, func(m *Metrics) {
 		ctx := context.Background()
-		m.IncRateLimitDeferral(ctx, "", ratelimit.DeferRamping)
-		m.IncRateLimitDeferral(ctx, "", ratelimit.DeferRamping)
-		m.IncRateLimitDeferral(ctx, "", ratelimit.DeferSaturated)
+		m.IncRateLimitDeferral(ctx, "api.example.com", ratelimit.DeferThrottled)
 		m.IncRateLimitDeferral(ctx, "api.example.com", ratelimit.DeferThrottled)
 		m.IncRateLimitDeferral(ctx, "api.example.com", ratelimit.DeferAtCapacity)
 	})
@@ -143,8 +141,7 @@ func TestRateLimitDeferrals_CountByCause(t *testing.T) {
 		}
 	}
 	want := map[string]int64{
-		"/ramping": 2, "/saturated": 1,
-		"api.example.com/throttled": 1, "api.example.com/capacity": 1,
+		"api.example.com/throttled": 2, "api.example.com/capacity": 1,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("deferrals = %v, want %v", got, want)
@@ -154,5 +151,5 @@ func TestRateLimitDeferrals_CountByCause(t *testing.T) {
 func TestSaturationMetrics_NilReceiverIsSafe(t *testing.T) {
 	var m *Metrics
 	m.SetSaturationSource(fakeSource{capacity: 1})
-	m.IncRateLimitDeferral(context.Background(), "", ratelimit.DeferRamping)
+	m.IncRateLimitDeferral(context.Background(), "", ratelimit.DeferAtCapacity)
 }

@@ -108,16 +108,6 @@ const (
 	// DeferAtCapacity: the governor is holding us below its own ceiling. Until is ZERO — we have
 	// no deadline from anyone, and inventing one would be presented to a consumer as the server's.
 	DeferAtCapacity DeferReason = "AtCapacity"
-
-	// DeferSaturated: the controller's OWN CPU is saturated, and the process-wide local capacity is
-	// full (#66). Cause names the reading. Local is true. Until is zero.
-	DeferSaturated DeferReason = "Saturated"
-
-	// DeferRamping: the local capacity is full and still on its startup ramp, the slow start a
-	// restarted controller takes into its backlog (#66). It is the ONE deferral that writes nothing
-	// on the object: a restart with hundreds of objects would otherwise write hundreds of
-	// Synced=False conditions for a state that is planned and clears itself. Local is true.
-	DeferRamping DeferReason = "Ramping"
 )
 
 // Cause is the reason's telemetry value, the same one provider-runtime reports.
@@ -127,10 +117,6 @@ func (r DeferReason) Cause() string {
 		return "throttled"
 	case DeferAtCapacity:
 		return "capacity"
-	case DeferSaturated:
-		return "saturated"
-	case DeferRamping:
-		return "ramping"
 	}
 	return string(r)
 }
@@ -143,16 +129,6 @@ type Deferral struct {
 	// Until is the server's OWN deadline, set only for DeferThrottled. Zero for DeferAtCapacity,
 	// where the caller requeues with a short jittered delay instead of claiming a deadline.
 	Until time.Time
-
-	// Local is true when the process-wide LOCAL capacity (the controller's own CPU saturation, #66)
-	// declined the pass, rather than a key's state. Key may then be empty: the local capacity bounds
-	// every gated pass, keyed or not.
-	Local bool
-	// Capacity is the capacity that was full, for the message on the object.
-	Capacity int
-	// Cause explains a local deferral: the saturated reading for DeferSaturated, or that the
-	// sampler is not running (a wiring defect that must be visible, never a quiet ramp).
-	Cause string
 }
 
 // DeferredError is what a reconcile pass returns when the governor declined to let it call the
@@ -176,9 +152,6 @@ type DeferredError struct {
 func (e *DeferredError) Error() string {
 	if e.Deferral == nil {
 		return "reconcile deferred"
-	}
-	if e.Deferral.Local {
-		return "reconcile deferred: local capacity " + string(e.Deferral.Reason)
 	}
 	return "reconcile deferred: " + e.Deferral.Key + " " + string(e.Deferral.Reason)
 }

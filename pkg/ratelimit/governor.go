@@ -40,6 +40,25 @@ type Governor interface {
 	RequeueAfter(d *Deferral) time.Duration
 }
 
+// LocalGate is implemented by a governor that bounds the whole process by its own CPU saturation. A
+// worker takes a slot BEFORE it pops the queue, so low capacity behaves like fewer workers and the
+// queue's order is the order work runs in.
+//
+// AFTER THE POP IS WHERE THIS USED TO BE, AND IT INVERTED PRIORITY. A popped item that found no slot
+// slept through its requeue delay, about 30s, so it missed the moment a slot freed, and the next
+// undelayed resync took it. A spec change waited without bound behind objects with nothing to do
+// (#72). Keys stay after the pop because a key needs the object; local capacity needs nothing from it.
+//
+// ONE GOVERNOR, ONE QUEUE. A worker holds its slot while idle in the queue's Get, which is what makes
+// this "fewer workers", and it is only safe because nothing else competes for that slot. Sharing a
+// governor between controllers would let an idle worker on one hold the only slot while another has
+// a backlog, silently. The cdc and rest-dynamic-controller each run one controller per process.
+type LocalGate interface {
+	// AcquireLocal blocks until a slot is free and returns its release, safe to call more than once.
+	// It returns false when ctx ends first. Without saturation it returns at once.
+	AcquireLocal(ctx context.Context) (release func(), ok bool)
+}
+
 // RateLimitKeyer lets a handler name its rate-limit scope BEFORE a call is made. Optional: a
 // handler that does not implement it is never gated.
 //
@@ -104,10 +123,8 @@ type aimd struct {
 	// local is written under mu by the sampler and read without it.
 	local         atomic.Pointer[localState]
 	localInFlight int
-	// samplerStarted is set by Start. Until then nothing raises local capacity, so a local deferral
-	// must not pass for the quiet startup ramp: a governor whose sampler was never started would
-	// stay at 1 forever with no sign on any object (provider-runtime's second trap).
-	samplerStarted atomic.Bool
+	// localChanged is closed, under mu, whenever a slot frees or capacity changes, and replaced.
+	localChanged chan struct{}
 }
 
 // Starter is implemented by a governor that has a background loop to run: with saturation on, the
@@ -138,6 +155,7 @@ func NewWithSaturation(o Options, s SaturationOptions, log logging.Logger) (Gove
 	}
 	g.sat, g.log = sat, sat.log
 	g.local.Store(&localState{capacity: capacityFloor, ramping: capacityFloor < g.opts.Ceiling})
+	g.localChanged = make(chan struct{})
 	return g, nil
 }
 
@@ -146,7 +164,6 @@ func (g *aimd) Start(ctx context.Context) error {
 	if g.sat == nil {
 		return nil
 	}
-	g.samplerStarted.Store(true)
 	g.log.Info("Saturation sampler started", "cgroup", g.sat.dir, "samplePeriod", g.sat.opts.SamplePeriod.String())
 	g.sample()
 	t := time.NewTicker(g.sat.opts.SamplePeriod)
@@ -170,6 +187,9 @@ func (g *aimd) sample() {
 	next := g.sat.step(g.opts.Now(), r, *cur, g.opts.Ceiling, g.opts.RecoveryInterval)
 	if next != *cur {
 		g.local.Store(&next)
+		if next.capacity != cur.capacity {
+			g.wakeLocalWaitersLocked()
+		}
 	}
 	g.mu.Unlock()
 	if next.capacity < cur.capacity {
@@ -188,11 +208,42 @@ func (g *aimd) LocalCapacity() int {
 // LocalInput is the saturation input's last reading.
 func (g *aimd) LocalInput() InputSnapshot { return g.sat.snapshot() }
 
-// rampLeftLocked is how long the startup ramp still needs to bring capacity to the ceiling. A step
-// cannot happen between samples, so the sample period sets the pace when it is the longer.
-func (g *aimd) rampLeftLocked(capacity int) time.Duration {
-	step := max(g.sat.opts.StartupRampInterval, g.sat.opts.SamplePeriod)
-	return time.Duration(g.opts.Ceiling-capacity) * step
+// AcquireLocal implements LocalGate.
+func (g *aimd) AcquireLocal(ctx context.Context) (func(), bool) {
+	if g.sat == nil {
+		return func() {}, true
+	}
+	for {
+		g.mu.Lock()
+		if g.localInFlight < g.local.Load().capacity {
+			g.localInFlight++
+			g.mu.Unlock()
+			var once sync.Once
+			return func() { once.Do(g.releaseLocal) }, true
+		}
+		wake := g.localChanged
+		g.mu.Unlock()
+
+		select {
+		case <-wake:
+		case <-ctx.Done():
+			return func() {}, false
+		}
+	}
+}
+
+func (g *aimd) releaseLocal() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.localInFlight > 0 {
+		g.localInFlight--
+	}
+	g.wakeLocalWaitersLocked()
+}
+
+func (g *aimd) wakeLocalWaitersLocked() {
+	close(g.localChanged)
+	g.localChanged = make(chan struct{})
 }
 
 // New returns an AIMD governor. A Ceiling below 1 is raised to 1 rather than rejected: a governor
@@ -236,26 +287,8 @@ func (g *aimd) TryAcquire(key string) (func(), *Deferral) {
 			return nil, &Deferral{Key: key, Reason: DeferThrottled, Until: st.holdUntil}
 		}
 		if st.inFlight >= st.capacity {
-			return nil, &Deferral{Key: key, Reason: DeferAtCapacity, Capacity: st.capacity}
+			return nil, &Deferral{Key: key, Reason: DeferAtCapacity}
 		}
-	}
-	// The LOCAL capacity bounds every gated pass, keyed or not (#66). Checked after the key so a
-	// pass declined by its key never takes a local slot.
-	if g.sat != nil {
-		local := g.local.Load()
-		if g.localInFlight >= local.capacity {
-			d := &Deferral{Key: key, Reason: DeferAtCapacity, Local: true, Capacity: local.capacity, Cause: local.cause}
-			switch {
-			case local.cause != "":
-				d.Reason = DeferSaturated
-			case local.ramping && g.samplerStarted.Load():
-				d.Reason = DeferRamping
-			case local.ramping:
-				d.Cause = causeSamplerNotStarted
-			}
-			return nil, d
-		}
-		g.localInFlight++
 	}
 	if st != nil {
 		st.inFlight++
@@ -267,9 +300,6 @@ func (g *aimd) TryAcquire(key string) (func(), *Deferral) {
 			defer g.mu.Unlock()
 			if s, ok := g.keys[key]; key != "" && ok && s.inFlight > 0 {
 				s.inFlight--
-			}
-			if g.sat != nil && g.localInFlight > 0 {
-				g.localInFlight--
 			}
 		})
 	}, nil
@@ -412,17 +442,6 @@ func (g *aimd) RequeueAfter(d *Deferral) time.Duration {
 			return wait
 		}
 		return 0
-	}
-	if d.Local && g.sat != nil {
-		// Local capacity changes on the sampler's schedule: rises per recovery interval after a cut,
-		// per ramp step before one. Retrying sooner would only be declined again.
-		if d.Reason == DeferRamping {
-			g.mu.Lock()
-			left := g.rampLeftLocked(g.local.Load().capacity)
-			g.mu.Unlock()
-			return g.opts.Jitter(max(time.Second, min(g.opts.RecoveryInterval, left)))
-		}
-		return g.opts.Jitter(g.opts.RecoveryInterval)
 	}
 	return g.opts.Jitter(2 * time.Second)
 }

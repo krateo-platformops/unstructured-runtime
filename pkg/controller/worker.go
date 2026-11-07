@@ -181,143 +181,170 @@ func (c *Controller) runWorker(ctx context.Context) {
 	// Generate unique worker ID for tracking
 	workerID := fmt.Sprintf("worker-%d", time.Now().UnixNano()%10000)
 
-	for {
-		obj, priority, shutdown := c.queue.GetWithPriority()
-		if shutdown {
-			c.logger.Info("Shutting down worker", "workerID", workerID)
-			break
-		}
+	for c.processNext(ctx, workerID) {
+	}
+}
 
-		ev, ok := obj.(ctrlevent.Event)
-		if !ok {
-			c.queue.Forget(obj)
-			c.queue.Done(obj)
-			runtimeUtil.HandleError(fmt.Errorf("unexpected object in queue: %v", obj))
-			if c.metrics != nil {
-				c.metrics.AddReconcileInFlight(-1)
-			}
-			continue
-		}
+// acquireLocal takes a local capacity slot, waiting for one. It waits on the context Run was given,
+// not on ctx: reconcileCtx stays live through a drain, so a worker with no slot would hang the drain.
+func (c *Controller) acquireLocal() (func(), bool) {
+	gate, ok := c.governor.(ratelimit.LocalGate)
+	if !ok {
+		return func() {}, true
+	}
+	runCtx := c.runCtx
+	if runCtx == nil {
+		runCtx = context.Background()
+	}
+	return gate.AcquireLocal(runCtx)
+}
 
-		if c.metrics != nil {
-			c.metrics.AddReconcileInFlight(1)
-		}
+// processNext runs one item, holding a local slot from before the pop until it is done, on every
+// path out. It reports whether the worker should carry on.
+func (c *Controller) processNext(ctx context.Context, workerID string) bool {
+	release, ok := c.acquireLocal()
+	if !ok {
+		c.logger.Info("Shutting down worker", "workerID", workerID)
+		return false
+	}
+	defer release()
 
-		dig := ctrlevent.DigestForEvent(ev)
+	obj, priority, shutdown := c.queue.GetWithPriority()
+	if shutdown {
+		c.logger.Info("Shutting down worker", "workerID", workerID)
+		return false
+	}
 
-		// Start timing for processing
-		processingStartTime := time.Now()
-		queueLength := c.queue.Len()
-
-		// Calculate queue wait time
-		var queueWaitDuration time.Duration
-		if !ev.QueuedAt.IsZero() {
-			queueWaitDuration = processingStartTime.Sub(ev.QueuedAt)
-			if c.metrics != nil {
-				c.metrics.RecordQueueWaitDuration(ctx, queueWaitDuration)
-			}
-		}
-
-		traceId, err := shortid.Generate()
-		if err != nil {
-			runtimeUtil.HandleError(fmt.Errorf("cannot generate trace ID: %v", err))
-			if c.metrics != nil {
-				c.metrics.AddReconcileInFlight(-1)
-			}
-			continue
-		}
-		ctx = contextutils.BuildContext(ctx, contextutils.WithLogger(c.logger), contextutils.WithTraceId(traceId))
-
-		// ONE PASS PER OBJECT (#62). Another worker already holds this object, so park the event; it is
-		// requeued when that pass ends. Its `items` digest stays stored while parked, so further events
-		// of the same type keep deduplicating against it. Claimed here, after every early `continue`
-		// above, so no path leaves an object held.
-		if !c.objects.begin(ev, priority) {
-			c.queue.Done(ev)
-			if c.metrics != nil {
-				c.metrics.AddReconcileInFlight(-1)
-			}
-			continue
-		}
-		err = c.processItem(ctx, ev)
-
-		// End timing and calculate durations
-		processingEndTime := time.Now()
-		processingDuration := processingEndTime.Sub(processingStartTime)
-
-		var totalDuration time.Duration
-		if !ev.QueuedAt.IsZero() {
-			totalDuration = processingEndTime.Sub(ev.QueuedAt)
-		} else {
-			totalDuration = processingDuration
-		}
-		if c.metrics != nil {
-			c.metrics.RecordQueueWorkDuration(ctx, processingDuration)
-			c.metrics.RecordReconcileDuration(ctx, totalDuration)
-			switch classifyOutcome(err) {
-			case outcomeSuccess:
-				c.metrics.IncReconcileSuccess(ctx)
-			case outcomeDeferred, outcomeStatusConflict:
-				c.metrics.IncReconcileRequeueAfter(ctx)
-			default:
-				c.metrics.IncReconcileFailure(ctx)
-				c.metrics.IncReconcileErrorRequeue(ctx)
-			}
-		}
-
-		// Enhanced debug logging
-		c.logger.WithValues(
-			"kind", ev.ObjectRef.Kind,
-			"apiVersion", ev.ObjectRef.APIVersion,
-			"name", ev.ObjectRef.Name,
-			"namespace", ev.ObjectRef.Namespace,
-			"queuedAt", ev.QueuedAt,
-			"traceId", contextutils.TraceId(ctx, false),
-		).Debug("Event processed",
-			"priority", priority,
-			"type", ev.EventType,
-			"queueWaitTime", queueWaitDuration.String(),
-			"processingTime", processingDuration.String(),
-			"totalTime", totalDuration.String(),
-			"success", err == nil,
-			"workerID", workerID,
-			"queueLength", queueLength,
-		)
-
-		c.items.Delete(dig)
-		// FORGET ON SUCCESS ONLY (#51). Forget is how a limiter is told "this item recovered"; it
-		// deletes the item's failure record. Calling it unconditionally told the limiter that EVERY
-		// item was healthy, including the one that had just failed, and handleErr reads
-		// NumRequeues immediately afterwards:
-		//
-		//	NumRequeues(obj) >= maxRetries   was 0 >= maxRetries on every pass, never true,
-		//	                                 so the drop NEVER fired and an unprocessable event
-		//	                                 was retried forever with maxRetries configured and
-		//	                                 silently ignored
-		//	When(obj)                        also saw a zero count, so the builder default's
-		//	                                 exponential never climbed past its 3s base
-		//
-		// Both of this repo's in-house consumers were immune by accident rather than design: the
-		// cdc and rest-dynamic-controller override with NewExponentialTimedFailureRateLimiter,
-		// whose Forget only deletes after 2*maxDelay of idleness, so an unconditional Forget right
-		// after processing is a no-op for an actively-retrying item. Anything on the builder
-		// default was affected.
-		//
-		// NOT MOVED AFTER handleErr, which is the fix that looks complete and is not: the
-		// NumRequeues check would then be correct while the count was still wiped afterwards, so
-		// the NEXT pass would start from zero and the backoff half would stay broken.
-		if err == nil {
-			c.queue.Forget(ev)
-		}
-		c.queue.Done(ev)
-		c.handleErr(err, ev, priority)
-		for _, p := range c.objects.end(ev) {
-			c.queue.AddWithOpts(priorityqueue.AddOpts{RateLimited: false, Priority: p.priority}, p.event)
-		}
+	ev, ok := obj.(ctrlevent.Event)
+	if !ok {
+		c.queue.Forget(obj)
+		c.queue.Done(obj)
+		runtimeUtil.HandleError(fmt.Errorf("unexpected object in queue: %v", obj))
 		if c.metrics != nil {
 			c.metrics.AddReconcileInFlight(-1)
 		}
+		return true
 	}
+
+	if c.metrics != nil {
+		c.metrics.AddReconcileInFlight(1)
+	}
+
+	dig := ctrlevent.DigestForEvent(ev)
+
+	// Start timing for processing
+	processingStartTime := time.Now()
+	queueLength := c.queue.Len()
+
+	// Calculate queue wait time
+	var queueWaitDuration time.Duration
+	if !ev.QueuedAt.IsZero() {
+		queueWaitDuration = processingStartTime.Sub(ev.QueuedAt)
+		if c.metrics != nil {
+			c.metrics.RecordQueueWaitDuration(ctx, queueWaitDuration)
+		}
+	}
+
+	traceId, err := shortid.Generate()
+	if err != nil {
+		runtimeUtil.HandleError(fmt.Errorf("cannot generate trace ID: %v", err))
+		if c.metrics != nil {
+			c.metrics.AddReconcileInFlight(-1)
+		}
+		return true
+	}
+	ctx = contextutils.BuildContext(ctx, contextutils.WithLogger(c.logger), contextutils.WithTraceId(traceId))
+
+	// ONE PASS PER OBJECT (#62). Another worker already holds this object, so park the event; it is
+	// requeued when that pass ends. Its `items` digest stays stored while parked, so further events
+	// of the same type keep deduplicating against it. Claimed here, after every early `continue`
+	// above, so no path leaves an object held.
+	if !c.objects.begin(ev, priority) {
+		c.queue.Done(ev)
+		if c.metrics != nil {
+			c.metrics.AddReconcileInFlight(-1)
+		}
+		return true
+	}
+	err = c.processItem(ctx, ev)
+
+	// End timing and calculate durations
+	processingEndTime := time.Now()
+	processingDuration := processingEndTime.Sub(processingStartTime)
+
+	var totalDuration time.Duration
+	if !ev.QueuedAt.IsZero() {
+		totalDuration = processingEndTime.Sub(ev.QueuedAt)
+	} else {
+		totalDuration = processingDuration
+	}
+	if c.metrics != nil {
+		c.metrics.RecordQueueWorkDuration(ctx, processingDuration)
+		c.metrics.RecordReconcileDuration(ctx, totalDuration)
+		switch classifyOutcome(err) {
+		case outcomeSuccess:
+			c.metrics.IncReconcileSuccess(ctx)
+		case outcomeDeferred, outcomeStatusConflict:
+			c.metrics.IncReconcileRequeueAfter(ctx)
+		default:
+			c.metrics.IncReconcileFailure(ctx)
+			c.metrics.IncReconcileErrorRequeue(ctx)
+		}
+	}
+
+	// Enhanced debug logging
+	c.logger.WithValues(
+		"kind", ev.ObjectRef.Kind,
+		"apiVersion", ev.ObjectRef.APIVersion,
+		"name", ev.ObjectRef.Name,
+		"namespace", ev.ObjectRef.Namespace,
+		"queuedAt", ev.QueuedAt,
+		"traceId", contextutils.TraceId(ctx, false),
+	).Debug("Event processed",
+		"priority", priority,
+		"type", ev.EventType,
+		"queueWaitTime", queueWaitDuration.String(),
+		"processingTime", processingDuration.String(),
+		"totalTime", totalDuration.String(),
+		"success", err == nil,
+		"workerID", workerID,
+		"queueLength", queueLength,
+	)
+
+	c.items.Delete(dig)
+	// FORGET ON SUCCESS ONLY (#51). Forget is how a limiter is told "this item recovered"; it
+	// deletes the item's failure record. Calling it unconditionally told the limiter that EVERY
+	// item was healthy, including the one that had just failed, and handleErr reads
+	// NumRequeues immediately afterwards:
+	//
+	//	NumRequeues(obj) >= maxRetries   was 0 >= maxRetries on every pass, never true,
+	//	                                 so the drop NEVER fired and an unprocessable event
+	//	                                 was retried forever with maxRetries configured and
+	//	                                 silently ignored
+	//	When(obj)                        also saw a zero count, so the builder default's
+	//	                                 exponential never climbed past its 3s base
+	//
+	// Both of this repo's in-house consumers were immune by accident rather than design: the
+	// cdc and rest-dynamic-controller override with NewExponentialTimedFailureRateLimiter,
+	// whose Forget only deletes after 2*maxDelay of idleness, so an unconditional Forget right
+	// after processing is a no-op for an actively-retrying item. Anything on the builder
+	// default was affected.
+	//
+	// NOT MOVED AFTER handleErr, which is the fix that looks complete and is not: the
+	// NumRequeues check would then be correct while the count was still wiped afterwards, so
+	// the NEXT pass would start from zero and the backoff half would stay broken.
+	if err == nil {
+		c.queue.Forget(ev)
+	}
+	c.queue.Done(ev)
+	c.handleErr(err, ev, priority)
+	for _, p := range c.objects.end(ev) {
+		c.queue.AddWithOpts(priorityqueue.AddOpts{RateLimited: false, Priority: p.priority}, p.event)
+	}
+	if c.metrics != nil {
+		c.metrics.AddReconcileInFlight(-1)
+	}
+	return true
 }
 
 func (c *Controller) handleErr(err error, obj ctrlevent.Event, priority int) {
@@ -802,24 +829,10 @@ func (c *Controller) acquireRateLimit(ctx context.Context, el *unstructured.Unst
 func (c *Controller) deferPass(ctx context.Context, el *unstructured.Unstructured, d *ratelimit.Deferral) error {
 	log := contextutils.Logger(ctx).WithValues("rateLimitKey", d.Key, "reason", string(d.Reason))
 
-	// Before every branch below: the quiet ramp writes nothing on the object, so this counter is the
-	// only record that it happened.
 	c.metrics.IncRateLimitDeferral(ctx, d.Key, d.Reason)
 
 	after := c.governor.RequeueAfter(d)
-	// THE QUIET RAMP (#66, provider-runtime's first trap). The startup ramp is a planned slow start
-	// that clears itself; writing Synced=False for it would make a restart with N objects write N
-	// conditions, all false alarms. It is quiet here with NO caveat: the gate runs before every
-	// handler call, so a deferred pass has learned nothing that could need writing. Every other
-	// local deferral (saturated, recovering, an unstarted sampler) is written.
-	if d.Reason == ratelimit.DeferRamping {
-		log.Debug("Reconciliation deferred on the controller's startup ramp (not recorded)", "requeueAfter", after.String())
-		return &ratelimit.DeferredError{Deferral: d, After: after}
-	}
 	cond := condition.ReconcileDeferred(d.Key, d.Until)
-	if d.Local {
-		cond = condition.LocalReconcileDeferred(d.Capacity, d.Cause)
-	}
 
 	// AN UNCHANGED DEFERRAL IS NOT WRITTEN AGAIN. At capacity a key requeues every second or two
 	// with the same message, and during a long throttle every requeue carries the same deadline; a

@@ -2,14 +2,11 @@ package controller
 
 import (
 	"context"
-	"errors"
 	"testing"
 
 	"github.com/krateo-platformops/unstructured-runtime/pkg/logging"
-	"github.com/krateo-platformops/unstructured-runtime/pkg/ratelimit"
 	"github.com/krateo-platformops/unstructured-runtime/pkg/telemetry"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
@@ -22,42 +19,6 @@ func meteredForTest(t *testing.T) (*telemetry.Metrics, *sdkmetric.ManualReader) 
 	m, err := telemetry.NewWithMeter(provider.Meter("test"), logging.NewNopLogger(), "cdc-a")
 	require.NoError(t, err)
 	return m, reader
-}
-
-func deferredByCause(t *testing.T, reader *sdkmetric.ManualReader) map[string]int64 {
-	t.Helper()
-	var rm metricdata.ResourceMetrics
-	require.NoError(t, reader.Collect(context.Background(), &rm))
-	got := map[string]int64{}
-	for _, scope := range rm.ScopeMetrics {
-		for _, md := range scope.Metrics {
-			if md.Name != "unstructured_runtime.ratelimit.deferrals" {
-				continue
-			}
-			for _, dp := range md.Data.(metricdata.Sum[int64]).DataPoints {
-				cause, _ := dp.Attributes.Value(attribute.Key("cause"))
-				got[cause.AsString()] = dp.Value
-			}
-		}
-	}
-	return got
-}
-
-// THE QUIET RAMP IS STILL COUNTED. It writes nothing on the object, so the counter is its only
-// record; a count placed after the quiet return would lose exactly the deferrals a restart makes.
-func TestSaturation_TheQuietRampIsCounted(t *testing.T) {
-	g := satGov(t, "healthy", true)
-	holdLocalSlot(t, g)
-	ctrl, evt, _ := gateController(t, g, &countingClient{})
-	m, reader := meteredForTest(t)
-	ctrl.metrics = m
-
-	err := ctrl.processItem(context.TODO(), evt)
-
-	var de *ratelimit.DeferredError
-	require.True(t, errors.As(err, &de), "want a deferral, got %v", err)
-	require.Equal(t, ratelimit.DeferRamping, de.Deferral.Reason)
-	require.Equal(t, map[string]int64{"ramping": 1}, deferredByCause(t, reader))
 }
 
 // A saturating governor must reach the gauges through New, the way a real controller is built.

@@ -192,6 +192,9 @@ type Controller struct {
 	maxRetries        int
 	governor          ratelimit.Governor
 	objects           *objectGate
+	// runCtx is the context Run was given, cancelled at SIGTERM. A worker waiting for a local slot
+	// waits on it, because reconcileCtx stays live through a drain.
+	runCtx context.Context
 
 	// gracefulShutdownTimeout is the resolved drain window used by Run on shutdown.
 	// Guarded by gracefulShutdownMu so a future leader-election runnable can zero it via
@@ -663,6 +666,8 @@ func (c *Controller) Run(ctx context.Context, numWorkers int) error {
 	// stopWorkers stops wait.Until from relaunching runWorker once we begin draining.
 	stopWorkers := make(chan struct{})
 	var wg sync.WaitGroup
+
+	c.runCtx = ctx
 
 	c.logger.Info(fmt.Sprintf("Starting workers: %d", numWorkers))
 	for i := 0; i < numWorkers; i++ {
