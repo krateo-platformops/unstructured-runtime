@@ -12,6 +12,7 @@ import (
 	metricsserver "github.com/krateo-platformops/unstructured-runtime/pkg/metrics/server"
 	"github.com/krateo-platformops/unstructured-runtime/pkg/pluralizer"
 	"github.com/krateo-platformops/unstructured-runtime/pkg/telemetry"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/time/rate"
 	"k8s.io/client-go/util/workqueue"
 )
@@ -49,6 +50,9 @@ type options struct {
 	// is cancelled (SIGTERM) to let in-flight reconciles finish. nil => controller default (30s);
 	// 0 => disabled (abrupt); negative => wait forever. See controller.Options.GracefulShutdownTimeout.
 	gracefulShutdownTimeout *time.Duration
+
+	// tracerProvider is controller.Options.TracerProvider; nil => the process default.
+	tracerProvider trace.TracerProvider
 }
 
 func defaultOptions() options {
@@ -95,6 +99,16 @@ func WithNamespace(ns string) func(o *options) {
 func WithGracefulShutdownTimeout(d time.Duration) func(o *options) {
 	return func(o *options) {
 		o.gracefulShutdownTimeout = &d
+	}
+}
+
+// WithTracerProvider gives the controller its own TracerProvider for its reconcile traces (#77)
+// instead of the process default (telemetry.TracerProvider, set by telemetry.SetupTracing), the way
+// a test records the spans a pass emits. A non-nil provider, even a no-op one, means tracing is ON.
+// Same name as provider-runtime's reconciler option. See controller.Options.TracerProvider.
+func WithTracerProvider(tp trace.TracerProvider) func(o *options) {
+	return func(o *options) {
+		o.tracerProvider = tp
 	}
 }
 

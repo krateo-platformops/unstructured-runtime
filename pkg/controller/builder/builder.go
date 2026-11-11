@@ -105,6 +105,7 @@ func Build(ctx context.Context, conf Configuration, optsFuncs ...FuncOption) (*c
 		RateLimitGovernor:       opts.rateLimitGovernor,
 		ActionsEvent:            opts.actionsEvent,
 		GracefulShutdownTimeout: opts.gracefulShutdownTimeout,
+		TracerProvider:          opts.tracerProvider,
 	})
 	if err != nil {
 		opts.logger.Error(err, "failed to create controller")

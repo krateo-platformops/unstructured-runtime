@@ -2,6 +2,8 @@ package builder
 
 import (
 	"context"
+
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"testing"
 	"time"
 
@@ -63,6 +65,13 @@ func TestOptionSetters(t *testing.T) {
 
 	WithActionEvent(event.CRCreated, event.Update)(&o)
 	require.Equal(t, event.Update, o.actionsEvent.GetEventType(event.CRCreated))
+
+	// WithTracerProvider; unset means the process default.
+	require.Nil(t, defaultOptions().tracerProvider)
+	tp := sdktrace.NewTracerProvider()
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+	WithTracerProvider(tp)(&o)
+	require.Same(t, tp, o.tracerProvider)
 }
 
 func TestConfigurationValidate(t *testing.T) {
