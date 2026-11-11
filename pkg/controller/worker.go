@@ -465,7 +465,8 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 
 	// The reconcile root (#77, plumbing tracecontext, provider-runtime's D8). Every pass is a NEW
 	// root, linked to el's krateo.io/traceparent when it carries one; only the first act for a new
-	// value joins the upstream trace (beginAct, at the handler's external call). With tracing off the
+	// value joins the upstream trace (beginAct around Create/Update/Delete, or the handler's
+	// StartAct inside Observe). With tracing off the
 	// tracer is nil: nothing starts, and the inbound context is kept for InjectTraceparent only. The
 	// deferred RecordSpanError reads the named return value.
 	tracer := c.reconcileTracer()
@@ -474,7 +475,7 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 	ctx, span := tracecontext.StartReconcile(ctx, tracer, traceObj, decision, time.Now())
 	pass := offPass
 	if tracer != nil {
-		pass = &tracePass{tracer: tracer, span: span, d: decision, obj: traceObj, key: traceKey, uid: el.GetUID(), memo: &c.traces}
+		pass = &tracePass{tracer: tracer, span: span, d: decision, obj: traceObj, key: traceKey, uid: el.GetUID(), memo: &c.traces, c: c, target: el}
 	}
 	ctx = withTracePass(ctx, pass)
 	defer func() {
@@ -945,15 +946,11 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 	deletedAtEntry := meta.WasDeleted(el)
 
 	start := time.Now()
-	// #77: the marker due before the first act, then the joined act step (only for a new
-	// traceparent value, once). A marker conflict ends the pass before it acts.
-	actCtx, act, merr := c.beginAct(ctx, el, "observe")
-	if merr != nil {
-		return merr
-	}
-	observation, actionErr := c.externalClient.Observe(actCtx, el)
-	telemetry.RecordSpanError(act, actionErr)
-	act.End()
+	// #77: Observe is NOT an act for the runtime. A handler whose Observe applies changes calls
+	// StartAct before it does, which writes the marker on el and joins the upstream trace; a
+	// marker conflict comes back as its error and requeues quietly below (statusConflict).
+	tracePassFrom(ctx).observing(el)
+	observation, actionErr := c.externalClient.Observe(ctx, el)
 	if c.metrics != nil {
 		c.metrics.RecordObserveDuration(ctx, time.Since(start))
 		if actionErr != nil {

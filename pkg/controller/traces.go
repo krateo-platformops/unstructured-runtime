@@ -23,11 +23,15 @@ import (
 // what lives here is the per-object state tracecontext's package doc says each runtime keeps, ported
 // from provider-runtime v1.14.1 pkg/reconciler/traces.go.
 //
-// THE ACT STEP INCLUDES OBSERVE. provider-runtime's act steps are Create/Update/Delete because its
-// Observe is a pure read. The composition-dynamic-controller's Observe applies the release's children
-// (plumbing helm Reconcile), so here every handler's external call is an act, Observe included, and
-// the first one for a new value is the one that joins the upstream trace (agreed with the
-// provider-runtime session; see joinAct).
+// THE ACT IS DECLARED WHERE CHANGES ARE APPLIED. The runtime opens the act step around every
+// Create, Update and Delete, as provider-runtime does. It does NOT open one around Observe, because
+// whether an Observe applies anything is known only to the handler: rest-dynamic-controller's
+// Observe is a REST read, and the composition-dynamic-controller's Observe applies the release's
+// children (plumbing helm Reconcile) only when the release exists. Had the runtime treated every
+// Observe as the act, the first pass on a NEW composition would have joined the upstream at an
+// Observe that found no release and done nothing, written the marker, and left the install (the
+// next pass, Create) linked instead of joined: the frontend's request would never show the install.
+// So a handler whose Observe applies changes calls StartAct right before its mutating call.
 
 // memoState is what this process knows about the value a memo entry holds.
 type memoState int
@@ -168,6 +172,11 @@ type tracePass struct {
 	uid    types.UID
 	memo   *traceMemo
 	marked bool // the marker was written, or the write failed, this pass
+	// c and target are where the marker is written: target is the object the runtime's handler
+	// for this pass holds and writes status from (handleObserve re-reads it), set before the
+	// handler's external call.
+	c      *Controller
+	target *unstructured.Unstructured
 	// actJoined: this pass's act step for a new value has been parented on the upstream (D8).
 	actJoined bool
 }
@@ -196,13 +205,11 @@ func (p *tracePass) event(name string, attrs ...attribute.KeyValue) {
 	p.span.AddEvent(name, trace.WithAttributes(attrs...))
 }
 
-// joinAct opens the JOINED act step around the pass's external call, and only that one. Each event
-// is its own pass here, and for the composition-dynamic-controller every external call acts:
-// Observe applies the release's children, Create installs, Update upgrades, Delete uninstalls. So
-// the first pass for a new value in Parent mode joins the upstream at its external call, and every
-// other pass opens NO step span: provider-runtime has a span per step, but a child span per cdc
-// pass would double the span volume to say nothing the root does not. d.Remote is valid in Link
-// mode too, so the mode check is what keeps a value from being re-joined on every pass.
+// joinAct opens the JOINED act step, and only that one: the pass's first act (Create, Update,
+// Delete, or a handler's StartAct inside Observe) for a value in Parent mode. Every other act opens
+// NO step span: provider-runtime has a span per step, but a child span per pass would double the
+// span volume to say nothing the root does not. d.Remote is valid in Link mode too, so the mode
+// check is what keeps a value from being re-joined on every pass.
 func (p *tracePass) joinAct(ctx context.Context, name string) (context.Context, trace.Span) {
 	if p.tracer == nil || p.d.Mode != tracecontext.Parent || p.actJoined {
 		return ctx, trace.SpanFromContext(context.Background())
@@ -298,9 +305,72 @@ func truncate(s string, n int) string {
 // pass BEFORE the act, and the worker requeues it quietly.
 func (c *Controller) beginAct(ctx context.Context, el *unstructured.Unstructured, name string) (context.Context, trace.Span, error) {
 	p := tracePassFrom(ctx)
+	p.observing(el)
 	if err := c.writeMarkerIf(ctx, el, p, tracecontext.BeforeFirstAction); err != nil {
 		return ctx, nil, err
 	}
 	actCtx, span := p.joinAct(ctx, name)
 	return actCtx, span, nil
+}
+
+// observing records el as the object this pass's marker is written on, before the handler's
+// external call.
+func (p *tracePass) observing(el *unstructured.Unstructured) {
+	if p.tracer == nil {
+		return
+	}
+	p.target = el
+}
+
+// StartAct declares the handler's act inside Observe: call it right before the call that APPLIES
+// changes (an apply, an install, a write to the external system), with ctx as Observe received it
+// and mg the object Observe was given (or the handler's copy of it). Create, Update and Delete need
+// not call it, because the runtime opens their act step itself; a call there does nothing.
+//
+// For the first act on a new krateo.io/traceparent value it writes the marker
+// krateo.io/traceparent-continued and opens the act step joined to the upstream trace, so the
+// change shows in the trace that asked for it (#77). The marker is written under mg's
+// resourceVersion, and on mg only the resourceVersion and the marker change, so the handler's later
+// writes stay version-checked. Every other call, and every call
+// with tracing off, opens nothing and returns ctx.
+//
+// A non-nil error means the marker write lost an optimistic-lock race: the handler must NOT act,
+// and should return the error (wrapped with %w if at all). It wraps tools.ErrStatusConflict, so the
+// runtime requeues the pass quietly and the next one reads the object afresh.
+//
+// end records the act's error on the act step and ends it; call it once, after the act.
+func StartAct(ctx context.Context, mg *unstructured.Unstructured, name string) (actCtx context.Context, end func(error), err error) {
+	p := tracePassFrom(ctx)
+	if p.tracer == nil || p.c == nil || p.target == nil {
+		return ctx, func(error) {}, nil
+	}
+	// The marker is written under the HANDLER's resourceVersion (mg), its freshest view: a handler
+	// that wrote the object earlier in Observe holds a newer version than the runtime's copy, and a
+	// patch under the older one would conflict on every pass and never act. The runtime's copy is
+	// advanced only when it held that same version, so a runtime copy that was already stale stays
+	// stale, exactly as it would have without the marker.
+	obj := p.target
+	if mg != nil {
+		obj = mg
+	}
+	before, wasMarked := obj.GetResourceVersion(), p.marked
+	if err := p.c.writeMarkerIf(ctx, obj, p, tracecontext.BeforeFirstAction); err != nil {
+		return ctx, func(error) {}, err
+	}
+	if v, wrote := obj.GetAnnotations()[tracecontext.AnnotationKeyTraceparentContinued]; wrote && v == p.d.Marker && !wasMarked && p.marked && obj != p.target {
+		if p.target.GetResourceVersion() == before {
+			p.target.SetResourceVersion(obj.GetResourceVersion())
+		}
+		ann := p.target.GetAnnotations()
+		if ann == nil {
+			ann = map[string]string{}
+		}
+		ann[tracecontext.AnnotationKeyTraceparentContinued] = v
+		p.target.SetAnnotations(ann)
+	}
+	actCtx, span := p.joinAct(ctx, name)
+	return actCtx, func(err error) {
+		telemetry.RecordSpanError(span, err)
+		span.End()
+	}, nil
 }

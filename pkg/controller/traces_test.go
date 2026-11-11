@@ -42,25 +42,51 @@ func upstreamSC(t *testing.T) trace.SpanContext {
 	return d.Remote
 }
 
-// countingObserver counts Observe calls, so a test can tell "the pass acted" from "it did not".
-type countingObserver struct {
+// actingClient is a handler. Its Observe applies changes only when the "release" exists, and then
+// declares the act with StartAct first, as the composition-dynamic-controller's does; with exists
+// false it applies nothing and returns ResourceExists false, so the runtime dispatches Create.
+type actingClient struct {
 	fakeExternalClient
+	exists   bool
+	bumpRV   string // when set, Observe "writes" the object first: the handler's copy is newer
 	observes atomic.Int32
+	applies  atomic.Int32
+	creates  atomic.Int32
+	actErrs  []error
 }
 
-func (c *countingObserver) Observe(ctx context.Context, mg *unstructured.Unstructured) (ExternalObservation, error) {
+func (c *actingClient) Observe(ctx context.Context, el *unstructured.Unstructured) (ExternalObservation, error) {
 	c.observes.Add(1)
+	if !c.exists {
+		return ExternalObservation{ResourceExists: false}, nil
+	}
+	mg := el.DeepCopy() // handlers deep-copy, so StartAct must reach the runtime's copy too
+	if c.bumpRV != "" {
+		mg.SetResourceVersion(c.bumpRV)
+	}
+	actCtx, end, err := StartAct(ctx, mg, "apply")
+	c.actErrs = append(c.actErrs, err)
+	if err != nil {
+		return ExternalObservation{}, err
+	}
+	c.applies.Add(1)
+	_ = actCtx // a real handler passes it to the call that applies
+	end(nil)
 	return ExternalObservation{ResourceExists: true, ResourceUpToDate: true}, nil
 }
 
+func (c *actingClient) Create(ctx context.Context, mg *unstructured.Unstructured) error {
+	c.creates.Add(1)
+	return nil
+}
+
 type traceHarness struct {
-	t        *testing.T
-	opts     Options
-	ctrl     *Controller
-	rec      *tracetest.SpanRecorder
-	ext      *countingObserver
-	name     string
-	tracerOn bool
+	t    *testing.T
+	opts Options
+	ctrl *Controller
+	rec  *tracetest.SpanRecorder
+	ext  *actingClient
+	name string
 }
 
 func newTraceHarness(t *testing.T, tracerOn bool, annotations map[string]string) *traceHarness {
@@ -71,7 +97,7 @@ func newTraceHarness(t *testing.T, tracerOn bool, annotations map[string]string)
 	ctrl, err := New(sid, opts)
 	require.NoError(t, err)
 
-	h := &traceHarness{t: t, opts: opts, ctrl: ctrl, rec: tracetest.NewSpanRecorder(), ext: &countingObserver{}, name: "traced", tracerOn: tracerOn}
+	h := &traceHarness{t: t, opts: opts, ctrl: ctrl, rec: tracetest.NewSpanRecorder(), ext: &actingClient{exists: true}, name: "traced"}
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(h.rec))
 	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
 	ctrl.tracerFn = func() trace.Tracer {
@@ -90,9 +116,9 @@ func newTraceHarness(t *testing.T, tracerOn bool, annotations map[string]string)
 	return h
 }
 
-func (h *traceHarness) pass() error {
+func (h *traceHarness) pass(et ctrlevent.EventType) error {
 	return h.ctrl.processItem(context.TODO(), ctrlevent.Event{
-		EventType: ctrlevent.Observe,
+		EventType: et,
 		ObjectRef: objectref.ObjectRef{APIVersion: "test.example.org/v1", Kind: "Test", Name: h.name, Namespace: h.opts.Namespace},
 	})
 }
@@ -103,18 +129,34 @@ func (h *traceHarness) live() *unstructured.Unstructured {
 	return got
 }
 
-// failMarkerPatches makes every patch that writes the marker fail with err; other patches pass.
-func (h *traceHarness) failMarkerPatches(err error) *atomic.Int32 {
-	var n atomic.Int32
+func (h *traceHarness) marker() (string, bool) {
+	v, ok := h.live().GetAnnotations()[tracecontext.AnnotationKeyTraceparentContinued]
+	return v, ok
+}
+
+func (h *traceHarness) memoState() (memoState, bool) {
+	h.ctrl.traces.mu.Lock()
+	defer h.ctrl.traces.mu.Unlock()
+	e, ok := h.ctrl.traces.entries[types.NamespacedName{Namespace: h.opts.Namespace, Name: h.name}]
+	return e.state, ok
+}
+
+// markerPatches intercepts every patch that writes the marker: it records the patch and, when err
+// is set, fails it; other patches pass through.
+func (h *traceHarness) markerPatches(err error) *[]string {
+	var seen []string
 	h.opts.Client.(*dynamicfake.FakeDynamicClient).PrependReactor("patch", "tests", func(a clienttesting.Action) (bool, runtime.Object, error) {
 		pa, ok := a.(clienttesting.PatchAction)
 		if !ok || !strings.Contains(string(pa.GetPatch()), tracecontext.AnnotationKeyTraceparentContinued) {
 			return false, nil, nil
 		}
-		n.Add(1)
-		return true, nil, err
+		seen = append(seen, string(pa.GetPatch()))
+		if err != nil {
+			return true, nil, err
+		}
+		return false, nil, nil
 	})
-	return &n
+	return &seen
 }
 
 // split separates the recorded spans into reconcile roots and act steps joined to upstream.
@@ -150,16 +192,19 @@ func hasEvent(s sdktrace.ReadOnlySpan, name string) bool {
 	return false
 }
 
-// The first pass for a new value: a NEW root linked to the upstream, the observe act joined to it,
-// and the marker on the object. The second pass reads the marker: a root linked to the upstream,
-// and nothing joined. Before #77 every pass's root was the upstream's CHILD, so a composition's
-// trace grew by a reconcile per resync for as long as the annotation stayed (62,123 spans on 057).
-func TestTraceFirstActJoinsUpstreamThenLinks(t *testing.T) {
-	up := upstreamSC(t)
-	h := newTraceHarness(t, true, map[string]string{tracecontext.AnnotationKeyTraceparent: upstreamTP})
+var withUpstream = map[string]string{tracecontext.AnnotationKeyTraceparent: upstreamTP}
 
-	require.NoError(t, h.pass())
-	require.Equal(t, int32(1), h.ext.observes.Load(), "control: the first pass must reach Observe")
+// An Observe that applies changes declares its act: the first pass for a new value is a NEW root
+// linked to the upstream, with the act joined to it and the marker on the object; the second pass
+// reads the marker, links, and joins nothing. Before #77 every pass's root was the upstream's
+// CHILD, so a composition's trace grew by a reconcile per resync for as long as the annotation
+// stayed (62,123 spans in one trace on krateo-057).
+func TestTraceObserveThatAppliesJoinsOnceThenLinks(t *testing.T) {
+	up := upstreamSC(t)
+	h := newTraceHarness(t, true, withUpstream)
+
+	require.NoError(t, h.pass(ctrlevent.Observe))
+	require.Equal(t, int32(1), h.ext.applies.Load(), "control: the first pass must reach the apply")
 	roots, joined, other := split(h.rec.Ended(), up)
 	require.Len(t, roots, 1, "one reconcile root per pass")
 	require.Len(t, joined, 1, "the first act for a new value joins the upstream")
@@ -169,17 +214,17 @@ func TestTraceFirstActJoinsUpstreamThenLinks(t *testing.T) {
 	require.False(t, root.Parent().IsValid(), "the root is a new root, never the upstream's child")
 	require.NotEqual(t, up.TraceID(), root.SpanContext().TraceID())
 	require.True(t, linksTo(root, up), "the root links to the upstream")
-	require.Equal(t, "observe", act.Name())
-	require.Equal(t, up.TraceID(), act.SpanContext().TraceID(), "the act is in the upstream trace")
+	require.Equal(t, "apply", act.Name(), "the act is the step the handler declared")
 	require.True(t, linksTo(act, root.SpanContext()), "the act links back to its reconcile root")
 	require.True(t, linksTo(root, act.SpanContext()), "the root links to the sampled act")
 
-	require.Equal(t, tracecontext.Canonical(up), h.live().GetAnnotations()[tracecontext.AnnotationKeyTraceparentContinued],
-		"the marker records the continued value")
+	v, ok := h.marker()
+	require.True(t, ok, "the marker is written before the act")
+	require.Equal(t, tracecontext.Canonical(up), v)
 
 	h.rec.Reset()
-	require.NoError(t, h.pass())
-	require.Equal(t, int32(2), h.ext.observes.Load(), "control: the second pass must reach Observe too")
+	require.NoError(t, h.pass(ctrlevent.Observe))
+	require.Equal(t, int32(2), h.ext.applies.Load(), "control: the second pass must reach the apply too")
 	roots, joined, other = split(h.rec.Ended(), up)
 	require.Len(t, roots, 1)
 	require.Empty(t, joined, "a continued value is linked, never joined again")
@@ -188,69 +233,128 @@ func TestTraceFirstActJoinsUpstreamThenLinks(t *testing.T) {
 	require.Zero(t, h.ctrl.traces.len(), "a read that shows the marker confirms and drops the memo entry")
 }
 
-// A marker write that loses an optimistic-lock race ends the pass BEFORE it acts, quietly (it wraps
-// tools.ErrStatusConflict), with the conflict on the root and the memo left as it was.
-func TestTraceMarkerConflictRequeuesBeforeActing(t *testing.T) {
-	h := newTraceHarness(t, true, map[string]string{tracecontext.AnnotationKeyTraceparent: upstreamTP})
-	writes := h.failMarkerPatches(apierrors.NewConflict(schema.GroupResource{Group: "test.example.org", Resource: "tests"}, h.name, errors.New("changed")))
+// THE CASE THE TRACEPARENT EXISTS FOR: a new composition. Its first Observe finds no release and
+// applies nothing, so it must not join and must not mark; the Create pass that installs is the one
+// that joins the upstream. Had Observe been the act, the marker would have been written at the no-op
+// Observe and the install would have only linked.
+func TestTraceNewObjectJoinsAtCreateNotAtObserve(t *testing.T) {
+	up := upstreamSC(t)
+	h := newTraceHarness(t, true, withUpstream)
+	h.ext.exists = false
 
-	err := h.pass()
-	require.ErrorIs(t, err, errTraceMarkerConflict)
-	require.Equal(t, int32(1), writes.Load(), "control: the marker write was attempted")
-	require.Zero(t, h.ext.observes.Load(), "a marker conflict must end the pass before Observe")
-	roots, joined, _ := split(h.rec.Ended(), upstreamSC(t))
+	require.NoError(t, h.pass(ctrlevent.Observe))
+	require.Equal(t, int32(1), h.ext.observes.Load(), "control: the pass reached Observe")
+	roots, joined, other := split(h.rec.Ended(), up)
 	require.Len(t, roots, 1)
-	require.Empty(t, joined, "nothing acted, so nothing joined")
-	require.True(t, hasEvent(roots[0], tracecontext.EventConflict))
+	require.Empty(t, joined, "an Observe that applied nothing joins nothing")
+	require.Empty(t, other)
+	_, marked := h.marker()
+	require.False(t, marked, "a pass that does not act writes no marker")
+	st, ok := h.memoState()
+	require.True(t, ok)
+	require.Equal(t, memoSeen, st, "the value is remembered as seen, so Create still joins")
 
-	h.ctrl.traces.mu.Lock()
-	e := h.ctrl.traces.entries[types.NamespacedName{Namespace: h.opts.Namespace, Name: h.name}]
-	h.ctrl.traces.mu.Unlock()
-	require.Equal(t, memoSeen, e.state, "a conflict leaves the memo as it was: the next pass reads afresh")
+	h.rec.Reset()
+	require.NoError(t, h.pass(ctrlevent.Create))
+	require.Equal(t, int32(1), h.ext.creates.Load(), "control: the Create pass reached Create")
+	roots, joined, _ = split(h.rec.Ended(), up)
+	require.Len(t, roots, 1)
+	require.Len(t, joined, 1, "the install joins the upstream")
+	require.Equal(t, "create", joined[0].Name())
+	v, _ := h.marker()
+	require.Equal(t, tracecontext.Canonical(up), v)
+}
+
+// A marker write that loses an optimistic-lock race ends the pass BEFORE it acts, quietly (it wraps
+// tools.ErrStatusConflict), with the conflict on the root and the memo left as it was: at the
+// handler's StartAct and at the runtime's Create alike.
+func TestTraceMarkerConflictRequeuesBeforeActing(t *testing.T) {
+	conflict := apierrors.NewConflict(schema.GroupResource{Group: "test.example.org", Resource: "tests"}, "traced", errors.New("changed"))
+	for _, tc := range []struct {
+		name   string
+		exists bool
+		event  ctrlevent.EventType
+		acted  func(*actingClient) int32
+	}{
+		{"observe", true, ctrlevent.Observe, func(c *actingClient) int32 { return c.applies.Load() }},
+		{"create", false, ctrlevent.Create, func(c *actingClient) int32 { return c.creates.Load() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newTraceHarness(t, true, withUpstream)
+			h.ext.exists = tc.exists
+			writes := h.markerPatches(conflict)
+
+			err := h.pass(tc.event)
+			require.ErrorIs(t, err, errTraceMarkerConflict)
+			require.Len(t, *writes, 1, "control: the marker write was attempted")
+			require.Zero(t, tc.acted(h.ext), "a marker conflict must end the pass before it acts")
+			roots, joined, _ := split(h.rec.Ended(), upstreamSC(t))
+			require.Len(t, roots, 1)
+			require.Empty(t, joined, "nothing acted, so nothing joined")
+			require.True(t, hasEvent(roots[0], tracecontext.EventConflict))
+			st, _ := h.memoState()
+			require.Equal(t, memoSeen, st, "a conflict leaves the memo as it was: the next pass reads afresh")
+		})
+	}
+}
+
+// A handler that wrote the object earlier in Observe holds a newer resourceVersion than the
+// runtime's copy. The marker must be written under the HANDLER's version: under the runtime's older
+// one it would conflict on every pass, and the handler would never act.
+func TestTraceMarkerUsesTheHandlersResourceVersion(t *testing.T) {
+	h := newTraceHarness(t, true, withUpstream)
+	h.ext.bumpRV = "7"
+	writes := h.markerPatches(nil)
+
+	require.NoError(t, h.pass(ctrlevent.Observe))
+	require.Len(t, *writes, 1)
+	require.Contains(t, (*writes)[0], `"resourceVersion":"7"`, "the patch carries the handler's version")
+	require.Equal(t, int32(1), h.ext.applies.Load())
 }
 
 // Any other marker failure (RBAC, a webhook) lets the pass act, records trace.marker_failed, and
 // remembers the value as failed, so the next pass LINKS although the object never got the marker.
 func TestTraceMarkerFailureActsAndThenLinks(t *testing.T) {
 	up := upstreamSC(t)
-	h := newTraceHarness(t, true, map[string]string{tracecontext.AnnotationKeyTraceparent: upstreamTP})
-	writes := h.failMarkerPatches(apierrors.NewForbidden(schema.GroupResource{Group: "test.example.org", Resource: "tests"}, h.name, errors.New("rbac")))
+	h := newTraceHarness(t, true, withUpstream)
+	writes := h.markerPatches(apierrors.NewForbidden(schema.GroupResource{Group: "test.example.org", Resource: "tests"}, h.name, errors.New("rbac")))
 
-	require.NoError(t, h.pass())
-	require.Equal(t, int32(1), writes.Load())
-	require.Equal(t, int32(1), h.ext.observes.Load(), "a non-conflict marker failure must not stop the act")
+	require.NoError(t, h.pass(ctrlevent.Observe))
+	require.Len(t, *writes, 1)
+	require.Equal(t, int32(1), h.ext.applies.Load(), "a non-conflict marker failure must not stop the act")
 	roots, joined, _ := split(h.rec.Ended(), up)
 	require.Len(t, roots, 1)
 	require.Len(t, joined, 1, "the pass still joins the upstream at its act")
 	require.True(t, hasEvent(roots[0], tracecontext.EventMarkerFailed))
-	_, marked := h.live().GetAnnotations()[tracecontext.AnnotationKeyTraceparentContinued]
+	_, marked := h.marker()
 	require.False(t, marked, "control: the object did not get the marker")
 
 	h.rec.Reset()
-	require.NoError(t, h.pass())
-	require.Equal(t, int32(1), writes.Load(), "the marker is not retried by a pass that remembers it failed")
-	require.Equal(t, int32(2), h.ext.observes.Load(), "control: the second pass reached Observe")
+	require.NoError(t, h.pass(ctrlevent.Observe))
+	require.Len(t, *writes, 1, "the marker is not retried by a pass that remembers it failed")
+	require.Equal(t, int32(2), h.ext.applies.Load(), "control: the second pass reached the apply")
 	roots, joined, _ = split(h.rec.Ended(), up)
 	require.Len(t, roots, 1)
 	require.Empty(t, joined, "a value remembered as failed is linked, not re-joined")
 }
 
 // With tracing off nothing starts, nothing is remembered, and no marker is written: the object is
-// not touched on behalf of traces this process does not export.
+// not touched on behalf of traces this process does not export. StartAct is a no-op.
 func TestTraceOffWritesNothing(t *testing.T) {
-	h := newTraceHarness(t, false, map[string]string{tracecontext.AnnotationKeyTraceparent: upstreamTP})
-	require.NoError(t, h.pass())
-	require.Equal(t, int32(1), h.ext.observes.Load(), "control: the pass reached Observe")
+	h := newTraceHarness(t, false, withUpstream)
+	writes := h.markerPatches(nil)
+	require.NoError(t, h.pass(ctrlevent.Observe))
+	require.Equal(t, int32(1), h.ext.applies.Load(), "control: the pass reached the apply")
+	require.Equal(t, []error{nil}, h.ext.actErrs)
 	require.Empty(t, h.rec.Ended())
+	require.Empty(t, *writes)
 	require.Zero(t, h.ctrl.traces.len())
-	_, marked := h.live().GetAnnotations()[tracecontext.AnnotationKeyTraceparentContinued]
-	require.False(t, marked)
 }
 
 // #78: a paused pass still emits its root (the controller is alive) and marks it paused.
 func TestTracePausedPassIsMarked(t *testing.T) {
 	h := newTraceHarness(t, true, map[string]string{meta.AnnotationKeyReconciliationPaused: "true"})
-	require.NoError(t, h.pass())
+	require.NoError(t, h.pass(ctrlevent.Observe))
 	require.Zero(t, h.ext.observes.Load(), "control: a paused pass does not observe")
 	roots, _, _ := split(h.rec.Ended(), upstreamSC(t))
 	require.Len(t, roots, 1)
@@ -258,7 +362,7 @@ func TestTracePausedPassIsMarked(t *testing.T) {
 
 	// Control: an unpaused pass carries no such event.
 	h2 := newTraceHarness(t, true, nil)
-	require.NoError(t, h2.pass())
+	require.NoError(t, h2.pass(ctrlevent.Observe))
 	roots, _, _ = split(h2.rec.Ended(), upstreamSC(t))
 	require.Len(t, roots, 1)
 	require.False(t, hasEvent(roots[0], tracecontext.EventReconcilePaused))
