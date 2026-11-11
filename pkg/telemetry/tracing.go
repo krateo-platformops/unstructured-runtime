@@ -49,27 +49,61 @@ func SetupTracing(ctx context.Context, log logging.Logger, cfg Config) (func(con
 		sdktrace.WithResource(res),
 	)
 	otel.SetTracerProvider(tp)
-	tracingOn.Store(true)
+	SetTracerProvider(tp)
 	log.Info("OpenTelemetry tracing initialized", "serviceName", cfg.ServiceName, "compositionID", cfg.CompositionID)
-	return tp.Shutdown, nil
+	return func(ctx context.Context) error {
+		// Passes after shutdown start nothing and write no marker for a trace nobody exports.
+		// Only this provider is cleared: a later SetTracerProvider is someone else's.
+		if b := defaultProvider.Load(); b != nil && b.tp == trace.TracerProvider(tp) {
+			defaultProvider.CompareAndSwap(b, nil)
+		}
+		return tp.Shutdown(ctx)
+	}, nil
 }
 
-// tracingOn is whether SetupTracing installed an exporting pipeline. Tracer reads it so the
-// reconcile path can give tracecontext a nil Tracer with tracing off, which starts nothing and
-// allocates nothing; a non-nil Tracer, even a no-op one, means tracing is on.
-var tracingOn atomic.Bool
+// providerBox holds the process default TracerProvider; atomic.Pointer needs a concrete type.
+type providerBox struct{ tp trace.TracerProvider }
 
-// Tracer is the runtime's tracer when tracing is enabled, and nil otherwise. The reconcile root and
-// the joined act step are started through plumbing's tracecontext with it (#77): every pass is a new
-// root LINKED to the object's krateo.io/traceparent, and only the first act for a new value joins
-// the upstream trace. The old StartReconcileSpan, which made every pass a child of the annotation,
-// is gone: it is what grew a composition's traces without bound.
-func Tracer() trace.Tracer {
-	if !tracingOn.Load() {
+// defaultProvider is the process default TracerProvider, nil when tracing is off. It is NOT read
+// from the OTel global: otel.GetTracerProvider() cannot tell off from on (its delegate allocates a
+// span per Start either way), and a nil provider is what lets tracecontext start nothing and
+// allocate nothing with tracing off. Same design, and names, as provider-runtime's pkg/tracing.
+var defaultProvider atomic.Pointer[providerBox]
+
+// SetTracerProvider sets the process default TracerProvider that every controller built without
+// Options.TracerProvider reads, on every pass. nil turns tracing off. SetupTracing calls it when
+// tracing is enabled; a controller built before that call still picks it up.
+func SetTracerProvider(tp trace.TracerProvider) {
+	if tp == nil {
+		defaultProvider.Store(nil)
+		return
+	}
+	defaultProvider.Store(&providerBox{tp: tp})
+}
+
+// TracerProvider is the process default TracerProvider, nil when tracing is off.
+func TracerProvider() trace.TracerProvider {
+	if b := defaultProvider.Load(); b != nil {
+		return b.tp
+	}
+	return nil
+}
+
+// TracerFrom is this runtime's tracer from tp (its instrumentation scope), and nil for a nil tp.
+// A nil tracer means tracing is off to plumbing's tracecontext; a non-nil one, even a no-op one,
+// means on.
+func TracerFrom(tp trace.TracerProvider) trace.Tracer {
+	if tp == nil {
 		return nil
 	}
-	return otel.Tracer(tracerName)
+	return tp.Tracer(tracerName)
 }
+
+// Tracer is the runtime's tracer from the process default, nil with tracing off. The reconcile
+// root and the joined act step are started through plumbing's tracecontext with it (#77): every
+// pass is a new root LINKED to the object's krateo.io/traceparent, and only the first act for a new
+// value joins the upstream trace.
+func Tracer() trace.Tracer { return TracerFrom(TracerProvider()) }
 
 // RecordSpanError marks the span failed when err != nil; no-op otherwise.
 func RecordSpanError(span trace.Span, err error) {

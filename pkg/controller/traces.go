@@ -155,8 +155,8 @@ func (m *traceMemo) len() int {
 
 // reconcileTracer is the tracer a pass starts its root with: nil when tracing is off.
 func (c *Controller) reconcileTracer() trace.Tracer {
-	if c.tracerFn != nil {
-		return c.tracerFn()
+	if c.tracerProv != nil {
+		return telemetry.TracerFrom(c.tracerProv)
 	}
 	return telemetry.Tracer()
 }
