@@ -300,6 +300,8 @@ func TestTraceMarkerConflictRequeuesBeforeActing(t *testing.T) {
 			require.Len(t, roots, 1)
 			require.Empty(t, joined, "nothing acted, so nothing joined")
 			require.True(t, hasEvent(roots[0], tracecontext.EventConflict))
+			_, acted := rootActed(roots[0])
+			require.False(t, acted, "a pass that requeued before acting did not act")
 			st, _ := h.memoState()
 			require.Equal(t, memoSeen, st, "a conflict leaves the memo as it was: the next pass reads afresh")
 		})
@@ -425,6 +427,62 @@ func TestTraceProviderOptionAndProcessDefault(t *testing.T) {
 	roots, _, _ = split(optRec.Ended(), up)
 	require.Len(t, roots, 1, "Options.TracerProvider records the pass")
 	require.Len(t, nextRec.Ended(), before, "and the process default records nothing of it")
+}
+
+// rootActed reports the root's AttrActed and whether it is present.
+func rootActed(s sdktrace.ReadOnlySpan) (bool, bool) {
+	for _, kv := range s.Attributes() {
+		if kv.Key == tracecontext.AttrActed {
+			return kv.Value.AsBool(), true
+		}
+	}
+	return false, false
+}
+
+// Every pass that ACTS marks its root with AttrActed, whether its act joined the upstream (marked by
+// StartActStep) or opened no span at all (marked by joinAct): a tail sampler keeps those roots, and
+// a non-joined act's record of the change lives only in its root. A pass that does not act carries
+// no attribute, never false.
+func TestTraceRootMarkedActed(t *testing.T) {
+	up := upstreamSC(t)
+	lastRoot := func(h *traceHarness) sdktrace.ReadOnlySpan {
+		roots, _, _ := split(h.rec.Ended(), up)
+		require.NotEmpty(t, roots)
+		return roots[len(roots)-1]
+	}
+	mustActed := func(h *traceHarness, want bool, why string) {
+		t.Helper()
+		v, ok := rootActed(lastRoot(h))
+		if want {
+			require.True(t, ok && v, "%s: root must carry %s=true", why, tracecontext.AttrActed)
+		} else {
+			require.False(t, ok, "%s: root must carry no %s (got %v)", why, tracecontext.AttrActed, v)
+		}
+	}
+
+	// A new object: Observe applies nothing (not acted), then Create joins (acted), then a second
+	// Create for the same, now continued, value acts WITHOUT a step span (acted).
+	h := newTraceHarness(t, true, withUpstream)
+	h.ext.exists = false
+	require.NoError(t, h.pass(ctrlevent.Observe))
+	mustActed(h, false, "Observe that applied nothing")
+	require.NoError(t, h.pass(ctrlevent.Create))
+	mustActed(h, true, "Create that joined the upstream")
+	require.NoError(t, h.pass(ctrlevent.Create))
+	_, joined, other := split(h.rec.Ended(), up)
+	require.Len(t, joined, 1, "control: the second Create joins nothing")
+	require.Empty(t, other, "control: and opens no step span")
+	mustActed(h, true, "Create that opened no span")
+
+	// An Observe that applies through StartAct, after the value was continued: no span, acted.
+	h.ext.exists = true
+	require.NoError(t, h.pass(ctrlevent.Observe))
+	mustActed(h, true, "StartAct inside Observe, linked")
+
+	// A paused pass does not act.
+	p := newTraceHarness(t, true, map[string]string{meta.AnnotationKeyReconciliationPaused: "true"})
+	require.NoError(t, p.pass(ctrlevent.Observe))
+	mustActed(p, false, "paused pass")
 }
 
 func TestTraceMemoDecide(t *testing.T) {
