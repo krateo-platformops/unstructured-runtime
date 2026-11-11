@@ -147,6 +147,14 @@ type Options struct {
 	// The value MUST be set below the pod's terminationGracePeriodSeconds or the kubelet
 	// SIGKILLs mid-drain.
 	GracefulShutdownTimeout *time.Duration
+
+	// TracerProvider is this controller's TracerProvider for its reconcile traces (#77). Nil, the
+	// default, reads the process default (telemetry.TracerProvider, set by SetupTracing) on every
+	// pass, so tracing configured after New still takes effect. Set it to give one controller its
+	// own provider; a test sets an in-memory one to record the spans a pass emits. Any non-nil
+	// provider, even a no-op one, means tracing is ON: the controller then writes the
+	// krateo.io/traceparent-continued marker. Mirrors provider-runtime's WithTracerProvider.
+	TracerProvider trace.TracerProvider
 }
 
 func (o Options) validate() error {
@@ -195,9 +203,8 @@ type Controller struct {
 	objects           *objectGate
 	// traces is the per-object krateo.io/traceparent memo (#77, traces.go). The zero value is ready.
 	traces traceMemo
-	// tracerFn, when set, is this controller's reconcile tracer in place of telemetry.Tracer, so a
-	// test can record the spans a pass emits. Nil, the default, reads telemetry.Tracer per pass.
-	tracerFn func() trace.Tracer
+	// tracerProv is Options.TracerProvider; nil reads telemetry.TracerProvider on every pass.
+	tracerProv trace.TracerProvider
 	// runCtx is the context Run was given, cancelled at SIGTERM. A worker waiting for a local slot
 	// waits on it, because reconcileCtx stays live through a drain.
 	runCtx context.Context
@@ -594,6 +601,7 @@ func New(sid *shortid.Shortid, opts Options) (*Controller, error) {
 		metricsServer:           opts.MetricsServer,
 		maxRetries:              opts.MaxRetries,
 		governor:                opts.RateLimitGovernor,
+		tracerProv:              opts.TracerProvider,
 		objects:                 newObjectGate(),
 		gracefulShutdownTimeout: gracefulShutdownTimeout,
 	}, nil

@@ -10,9 +10,62 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace"
 )
 
+func TestTracerProviderDefault(t *testing.T) {
+	t.Cleanup(func() { SetTracerProvider(nil) })
+	SetTracerProvider(nil)
+	if TracerProvider() != nil || Tracer() != nil {
+		t.Fatal("with no default set, tracing must be off (nil provider, nil tracer)")
+	}
+	if TracerFrom(nil) != nil {
+		t.Fatal("TracerFrom(nil) must be nil")
+	}
+	tp := sdktrace.NewTracerProvider()
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+	SetTracerProvider(tp)
+	if TracerProvider() != trace.TracerProvider(tp) || Tracer() == nil {
+		t.Fatal("SetTracerProvider must make tp the default and tracing on")
+	}
+	SetTracerProvider(nil)
+	if TracerProvider() != nil {
+		t.Fatal("SetTracerProvider(nil) must turn tracing off")
+	}
+}
+
+// SetupTracing's shutdown clears the default it set, so passes after it start nothing and write no
+// marker for a trace nobody exports; a default someone else set later is left alone.
+func TestSetupTracingShutdownClearsOnlyItsOwnDefault(t *testing.T) {
+	t.Cleanup(func() { SetTracerProvider(nil) })
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
+	shutdown, err := SetupTracing(context.Background(), nil, Config{TracingEnabled: true, ServiceName: "t"})
+	if err != nil {
+		t.Fatalf("SetupTracing(enabled): %v", err)
+	}
+	if TracerProvider() == nil {
+		t.Fatal("control: SetupTracing(enabled) must set the default")
+	}
+	_ = shutdown(context.Background())
+	if TracerProvider() != nil {
+		t.Fatal("shutdown must clear the default it set")
+	}
+
+	shutdown2, err := SetupTracing(context.Background(), nil, Config{TracingEnabled: true, ServiceName: "t"})
+	if err != nil {
+		t.Fatalf("SetupTracing(enabled): %v", err)
+	}
+	other := sdktrace.NewTracerProvider()
+	t.Cleanup(func() { _ = other.Shutdown(context.Background()) })
+	SetTracerProvider(other)
+	_ = shutdown2(context.Background())
+	if TracerProvider() != trace.TracerProvider(other) {
+		t.Fatal("shutdown must not clear a default someone else set after it")
+	}
+}
+
 func TestSetupTracingDisabledIsNoop(t *testing.T) {
+	SetTracerProvider(nil)
 	shutdown, err := SetupTracing(context.Background(), nil, Config{TracingEnabled: false})
 	if err != nil {
 		t.Fatalf("SetupTracing(disabled): %v", err)

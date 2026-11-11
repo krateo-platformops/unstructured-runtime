@@ -13,6 +13,7 @@ import (
 	ctrlevent "github.com/krateo-platformops/unstructured-runtime/pkg/controller/event"
 	"github.com/krateo-platformops/unstructured-runtime/pkg/controller/objectref"
 	"github.com/krateo-platformops/unstructured-runtime/pkg/meta"
+	"github.com/krateo-platformops/unstructured-runtime/pkg/telemetry"
 	"github.com/stretchr/testify/require"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
@@ -91,21 +92,28 @@ type traceHarness struct {
 
 func newTraceHarness(t *testing.T, tracerOn bool, annotations map[string]string) *traceHarness {
 	t.Helper()
+	rec := tracetest.NewSpanRecorder()
+	var tp trace.TracerProvider
+	if tracerOn {
+		sdk := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
+		t.Cleanup(func() { _ = sdk.Shutdown(context.Background()) })
+		tp = sdk
+	}
+	return newTraceHarnessWith(t, tp, rec, annotations)
+}
+
+// newTraceHarnessWith builds the controller with Options.TracerProvider = tp (nil: the process
+// default), the way a consumer does.
+func newTraceHarnessWith(t *testing.T, tp trace.TracerProvider, rec *tracetest.SpanRecorder, annotations map[string]string) *traceHarness {
+	t.Helper()
 	sid, err := shortid.New(1, shortid.DefaultABC, 2342)
 	require.NoError(t, err)
 	opts := createTestOptions()
+	opts.TracerProvider = tp
 	ctrl, err := New(sid, opts)
 	require.NoError(t, err)
 
-	h := &traceHarness{t: t, opts: opts, ctrl: ctrl, rec: tracetest.NewSpanRecorder(), ext: &actingClient{exists: true}, name: "traced"}
-	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(h.rec))
-	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
-	ctrl.tracerFn = func() trace.Tracer {
-		if !tracerOn {
-			return nil
-		}
-		return tp.Tracer("test")
-	}
+	h := &traceHarness{t: t, opts: opts, ctrl: ctrl, rec: rec, ext: &actingClient{exists: true}, name: "traced"}
 	ctrl.externalClient = h.ext
 
 	obj := createTestUnstructured(h.name, opts.Namespace)
@@ -366,6 +374,57 @@ func TestTracePausedPassIsMarked(t *testing.T) {
 	roots, _, _ = split(h2.rec.Ended(), upstreamSC(t))
 	require.Len(t, roots, 1)
 	require.False(t, hasEvent(roots[0], tracecontext.EventReconcilePaused))
+}
+
+// The provider a pass uses: Options.TracerProvider when set, else the process default
+// (telemetry.TracerProvider), read on EVERY pass, so a default set after New still takes effect.
+// With neither, tracing is off.
+func TestTraceProviderOptionAndProcessDefault(t *testing.T) {
+	t.Cleanup(func() { telemetry.SetTracerProvider(nil) })
+	up := upstreamSC(t)
+
+	// Neither set: off.
+	telemetry.SetTracerProvider(nil)
+	off := newTraceHarnessWith(t, nil, tracetest.NewSpanRecorder(), withUpstream)
+	require.NoError(t, off.pass(ctrlevent.Observe))
+	require.Equal(t, int32(1), off.ext.applies.Load(), "control: the pass ran")
+	require.Zero(t, off.ctrl.traces.len(), "no provider anywhere: tracing is off")
+
+	// The default set AFTER New is picked up by the next pass.
+	defRec := tracetest.NewSpanRecorder()
+	def := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(defRec))
+	t.Cleanup(func() { _ = def.Shutdown(context.Background()) })
+	h := newTraceHarnessWith(t, nil, defRec, withUpstream)
+	telemetry.SetTracerProvider(def)
+	require.NoError(t, h.pass(ctrlevent.Observe))
+	roots, joined, _ := split(defRec.Ended(), up)
+	require.Len(t, roots, 1, "the process default records the pass")
+	require.Len(t, joined, 1)
+
+	// A default already set at New and REPLACED afterwards: the next pass uses the new one. This is
+	// the arm that tells "read on every pass" from "read once at New"; the arm above cannot, because
+	// a nil captured at New falls back to the default either way.
+	nextRec := tracetest.NewSpanRecorder()
+	next := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(nextRec))
+	t.Cleanup(func() { _ = next.Shutdown(context.Background()) })
+	r := newTraceHarnessWith(t, nil, nextRec, withUpstream) // built while def is the default
+	atNew := len(defRec.Ended())
+	telemetry.SetTracerProvider(next)
+	require.NoError(t, r.pass(ctrlevent.Observe))
+	roots, _, _ = split(nextRec.Ended(), up)
+	require.Len(t, roots, 1, "the replaced default records the pass")
+	require.Len(t, defRec.Ended(), atNew, "the default at New records nothing of it")
+
+	// The option wins over the default.
+	optRec := tracetest.NewSpanRecorder()
+	opt := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(optRec))
+	t.Cleanup(func() { _ = opt.Shutdown(context.Background()) })
+	before := len(nextRec.Ended())
+	o := newTraceHarnessWith(t, opt, optRec, withUpstream)
+	require.NoError(t, o.pass(ctrlevent.Observe))
+	roots, _, _ = split(optRec.Ended(), up)
+	require.Len(t, roots, 1, "Options.TracerProvider records the pass")
+	require.Len(t, nextRec.Ended(), before, "and the process default records nothing of it")
 }
 
 func TestTraceMemoDecide(t *testing.T) {
