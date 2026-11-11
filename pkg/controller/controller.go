@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/krateo-platformops/unstructured-runtime/pkg/ratelimit"
+	"go.opentelemetry.io/otel/trace"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sync"
 	"time"
@@ -192,6 +193,11 @@ type Controller struct {
 	maxRetries        int
 	governor          ratelimit.Governor
 	objects           *objectGate
+	// traces is the per-object krateo.io/traceparent memo (#77, traces.go). The zero value is ready.
+	traces traceMemo
+	// tracerFn, when set, is this controller's reconcile tracer in place of telemetry.Tracer, so a
+	// test can record the spans a pass emits. Nil, the default, reads telemetry.Tracer per pass.
+	tracerFn func() trace.Tracer
 	// runCtx is the context Run was given, cancelled at SIGTERM. A worker waiting for a local slot
 	// waits on it, because reconcileCtx stays live through a drain.
 	runCtx context.Context

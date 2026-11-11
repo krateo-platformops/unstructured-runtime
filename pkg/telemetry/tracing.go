@@ -2,11 +2,12 @@ package telemetry
 
 import (
 	"context"
+	"sync/atomic"
 
+	"github.com/krateo-platformops/plumbing/tracecontext"
 	"github.com/krateo-platformops/unstructured-runtime/pkg/logging"
 	"github.com/krateo-platformops/unstructured-runtime/pkg/meta"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/propagation"
@@ -15,15 +16,6 @@ import (
 )
 
 const tracerName = "github.com/krateo-platformops/unstructured-runtime"
-
-// reconcileObject is the minimal surface StartReconcileSpan needs (satisfied by
-// *unstructured.Unstructured) — keeps pkg/telemetry free of a k8s dependency.
-type reconcileObject interface {
-	GetKind() string
-	GetName() string
-	GetNamespace() string
-	GetAnnotations() map[string]string
-}
 
 // SetupTracing configures an OTLP trace pipeline and installs the W3C propagator, sharing the
 // metrics Resource (buildResource) so traces/metrics/logs all carry identical resource
@@ -57,31 +49,26 @@ func SetupTracing(ctx context.Context, log logging.Logger, cfg Config) (func(con
 		sdktrace.WithResource(res),
 	)
 	otel.SetTracerProvider(tp)
+	tracingOn.Store(true)
 	log.Info("OpenTelemetry tracing initialized", "serviceName", cfg.ServiceName, "compositionID", cfg.CompositionID)
 	return tp.Shutdown, nil
 }
 
-// StartReconcileSpan starts the per-reconcile root span, continuing any cross-composition
-// trace carried on the object's krateo.io/traceparent annotation (translated to/from the W3C
-// carrier key). Safe to call when tracing is disabled — the global tracer is a no-op.
-func StartReconcileSpan(ctx context.Context, obj reconcileObject) (context.Context, trace.Span) {
-	if ann := obj.GetAnnotations(); len(ann) > 0 {
-		if tp := ann[meta.AnnotationKeyTraceparent]; tp != "" {
-			carrier := propagation.MapCarrier{"traceparent": tp}
-			if ts := ann[meta.AnnotationKeyTracestate]; ts != "" {
-				carrier["tracestate"] = ts
-			}
-			ctx = otel.GetTextMapPropagator().Extract(ctx, carrier)
-		}
+// tracingOn is whether SetupTracing installed an exporting pipeline. Tracer reads it so the
+// reconcile path can give tracecontext a nil Tracer with tracing off, which starts nothing and
+// allocates nothing; a non-nil Tracer, even a no-op one, means tracing is on.
+var tracingOn atomic.Bool
+
+// Tracer is the runtime's tracer when tracing is enabled, and nil otherwise. The reconcile root and
+// the joined act step are started through plumbing's tracecontext with it (#77): every pass is a new
+// root LINKED to the object's krateo.io/traceparent, and only the first act for a new value joins
+// the upstream trace. The old StartReconcileSpan, which made every pass a child of the annotation,
+// is gone: it is what grew a composition's traces without bound.
+func Tracer() trace.Tracer {
+	if !tracingOn.Load() {
+		return nil
 	}
-	return otel.Tracer(tracerName).Start(ctx, "reconcile",
-		trace.WithSpanKind(trace.SpanKindServer),
-		trace.WithAttributes(
-			attribute.String("k8s.object.kind", obj.GetKind()),
-			attribute.String("k8s.object.name", obj.GetName()),
-			attribute.String("k8s.object.namespace", obj.GetNamespace()),
-		),
-	)
+	return otel.Tracer(tracerName)
 }
 
 // RecordSpanError marks the span failed when err != nil; no-op otherwise.
@@ -94,8 +81,16 @@ func RecordSpanError(span trace.Span, err error) {
 
 // InjectTraceparent stores the active W3C trace context on the annotations map under
 // krateo.io/traceparent (+ krateo.io/tracestate), so a child resource carries it for the next
-// controller to continue the distributed trace. No-op when no span context is active.
+// controller to continue the distributed trace. With tracing OFF there is no active span, and it
+// falls back to the inbound context the reconcile root kept (tracecontext.Inbound), so a trace that
+// came in on the object still reaches its children; it never writes the
+// krateo.io/traceparent-continued marker. No-op when neither is present.
 func InjectTraceparent(ctx context.Context, annotations map[string]string) {
+	if !trace.SpanContextFromContext(ctx).IsValid() {
+		if in := tracecontext.Inbound(ctx); in.IsValid() {
+			ctx = trace.ContextWithSpanContext(ctx, in)
+		}
+	}
 	carrier := propagation.MapCarrier{}
 	otel.GetTextMapPropagator().Inject(ctx, carrier)
 	if tp := carrier.Get("traceparent"); tp != "" {

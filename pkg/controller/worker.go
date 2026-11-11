@@ -9,6 +9,7 @@ import (
 
 	"github.com/krateo-platformops/plumbing/kubeutil/event"
 	"github.com/krateo-platformops/plumbing/shortid"
+	"github.com/krateo-platformops/plumbing/tracecontext"
 	contextutils "github.com/krateo-platformops/unstructured-runtime/pkg/context"
 	ctrlevent "github.com/krateo-platformops/unstructured-runtime/pkg/controller/event"
 	"github.com/krateo-platformops/unstructured-runtime/pkg/controller/objectref"
@@ -19,12 +20,14 @@ import (
 	"github.com/krateo-platformops/unstructured-runtime/pkg/tools"
 	unstructuredtools "github.com/krateo-platformops/unstructured-runtime/pkg/tools/unstructured"
 	"github.com/krateo-platformops/unstructured-runtime/pkg/tools/unstructured/condition"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	"slices"
 
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	runtimeUtil "k8s.io/apimachinery/pkg/util/runtime"
 )
 
@@ -448,23 +451,43 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 	)
 
 	ctx = contextutils.BuildContext(ctx, contextutils.WithLogger(lg))
+	traceKey := types.NamespacedName{Namespace: evt.ObjectRef.Namespace, Name: evt.ObjectRef.Name}
 	el, err := c.fetch(ctx, evt.ObjectRef, false)
 	if err != nil {
 		lg.Debug("Cannot fetch managed resource", "err", err) // This is returned as debug as debug info. This can occur normally if the resource was deleted.
+		if apierrors.IsNotFound(err) {
+			// The object is gone: its trace memo entry goes with it, tracing on or off (#77).
+			c.traces.forget(traceKey)
+		}
 		// if the object is not found, we will not retry to process it and we not throw an error
 		return nil
 	}
 
-	// Per-reconcile root span, continuing any cross-composition trace carried on el's
-	// krateo.io/traceparent annotation. No-op tracer when tracing is disabled; the deferred
-	// RecordSpanError reads the named return value.
-	ctx, span := telemetry.StartReconcileSpan(ctx, el)
+	// The reconcile root (#77, plumbing tracecontext, provider-runtime's D8). Every pass is a NEW
+	// root, linked to el's krateo.io/traceparent when it carries one; only the first act for a new
+	// value joins the upstream trace (beginAct around Create/Update/Delete, or the handler's
+	// StartAct inside Observe). With tracing off the
+	// tracer is nil: nothing starts, and the inbound context is kept for InjectTraceparent only. The
+	// deferred RecordSpanError reads the named return value.
+	tracer := c.reconcileTracer()
+	decision := c.traces.decide(tracer != nil, traceKey, el, time.Now(), tracecontext.DefaultContinueWindow)
+	traceObj := tracecontext.Object{Kind: el.GetKind(), Name: el.GetName(), Namespace: el.GetNamespace()}
+	ctx, span := tracecontext.StartReconcile(ctx, tracer, traceObj, decision, time.Now())
+	pass := offPass
+	if tracer != nil {
+		pass = &tracePass{tracer: tracer, span: span, d: decision, obj: traceObj, key: traceKey, uid: el.GetUID(), memo: &c.traces, c: c, target: el}
+	}
+	ctx = withTracePass(ctx, pass)
 	defer func() {
 		telemetry.RecordSpanError(span, err)
 		span.End()
 	}()
 
 	if meta.IsPaused(el) {
+		// #78. The root is still emitted, because the controller IS alive; the shared event is what
+		// tells a paused object from a freshly reconciled one in the traces (the same bytes
+		// provider-runtime records).
+		pass.event(tracecontext.EventReconcilePaused)
 		log := lg.WithValues("annotation", meta.AnnotationKeyReconciliationPaused)
 
 		log.Debug("Reconciliation is paused via the pause annotation")
@@ -520,6 +543,7 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 				c.recordEvent(el, event.Warning(reasonCannotUpdateManaged, actionUpdateManagedResource, err))
 				return err
 			}
+			tracePassFrom(ctx).forget() // the finalizer is gone, and the memo entry with it (#77)
 		}
 		// The policy is "do not touch the external resource", so this pass is DONE. Without this
 		// return, execution falls through to the dispatch below with WasDeleted(el) still true —
@@ -716,6 +740,13 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 				return err
 			}
 		}
+	}
+
+	// #77: a value whose continue window has closed is marked NOW: past the pause check and every
+	// path that releases the object without acting, and before anything acts. A conflict ends the
+	// pass before it acts; the worker requeues it quietly.
+	if merr := c.writeMarkerIf(ctx, el, tracePassFrom(ctx), tracecontext.Now); merr != nil {
+		return merr
 	}
 
 	lg.Debug("Start processing")
@@ -915,6 +946,10 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 	deletedAtEntry := meta.WasDeleted(el)
 
 	start := time.Now()
+	// #77: Observe is NOT an act for the runtime. A handler whose Observe applies changes calls
+	// StartAct before it does, which writes the marker on el and joins the upstream trace; a
+	// marker conflict comes back as its error and requeues quietly below (statusConflict).
+	tracePassFrom(ctx).observing(el)
 	observation, actionErr := c.externalClient.Observe(ctx, el)
 	if c.metrics != nil {
 		c.metrics.RecordObserveDuration(ctx, time.Since(start))
@@ -1208,7 +1243,15 @@ func (c *Controller) handleCreate(ctx context.Context, ref objectref.ObjectRef) 
 	}
 
 	start := time.Now()
-	actionErr := c.externalClient.Create(ctx, el)
+	// #77: the marker due before the first act, then the joined act step (only for a new
+	// traceparent value, once). A marker conflict ends the pass before it acts.
+	actCtx, act, merr := c.beginAct(ctx, el, "create")
+	if merr != nil {
+		return merr
+	}
+	actionErr := c.externalClient.Create(actCtx, el)
+	telemetry.RecordSpanError(act, actionErr)
+	act.End()
 	if c.metrics != nil {
 		c.metrics.RecordCreateDuration(ctx, time.Since(start))
 		if actionErr != nil {
@@ -1345,7 +1388,15 @@ func (c *Controller) handleUpdate(ctx context.Context, ref objectref.ObjectRef) 
 	}
 
 	start := time.Now()
-	actionErr := c.externalClient.Update(ctx, el)
+	// #77: the marker due before the first act, then the joined act step (only for a new
+	// traceparent value, once). A marker conflict ends the pass before it acts.
+	actCtx, act, merr := c.beginAct(ctx, el, "update")
+	if merr != nil {
+		return merr
+	}
+	actionErr := c.externalClient.Update(actCtx, el)
+	telemetry.RecordSpanError(act, actionErr)
+	act.End()
 	if c.metrics != nil {
 		c.metrics.RecordUpdateDuration(ctx, time.Since(start))
 		if actionErr != nil {
@@ -1425,7 +1476,15 @@ func (c *Controller) handleDelete(ctx context.Context, ref objectref.ObjectRef) 
 		return err
 	}
 	start := time.Now()
-	actionErr := c.externalClient.Delete(ctx, el)
+	// #77: the marker due before the first act, then the joined act step (only for a new
+	// traceparent value, once). A marker conflict ends the pass before it acts.
+	actCtx, act, merr := c.beginAct(ctx, el, "delete")
+	if merr != nil {
+		return merr
+	}
+	actionErr := c.externalClient.Delete(actCtx, el)
+	telemetry.RecordSpanError(act, actionErr)
+	act.End()
 	if c.metrics != nil {
 		c.metrics.RecordDeleteDuration(ctx, time.Since(start))
 		if actionErr != nil {
@@ -1494,6 +1553,7 @@ func (c *Controller) handleDelete(ctx context.Context, ref objectref.ObjectRef) 
 		c.recordEvent(el, event.Warning(reasonCannotUpdateManaged, actionUpdateManagedResource, err))
 		return err
 	}
+	tracePassFrom(ctx).forget() // the finalizer is gone, and the memo entry with it (#77)
 
 	// "External resource is gone", NOT "deletion requested" — because a nil from Delete establishes
 	// only the first (#34).
