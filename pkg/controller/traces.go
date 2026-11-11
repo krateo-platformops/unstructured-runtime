@@ -205,13 +205,20 @@ func (p *tracePass) event(name string, attrs ...attribute.KeyValue) {
 	p.span.AddEvent(name, trace.WithAttributes(attrs...))
 }
 
-// joinAct opens the JOINED act step, and only that one: the pass's first act (Create, Update,
+// joinAct marks the root as having acted (plumbing tracecontext.AttrActed) for EVERY act, and
+// opens the JOINED act step, and only that one: the pass's first act (Create, Update,
 // Delete, or a handler's StartAct inside Observe) for a value in Parent mode. Every other act opens
 // NO step span: provider-runtime has a span per step, but a child span per pass would double the
 // span volume to say nothing the root does not. d.Remote is valid in Link mode too, so the mode
 // check is what keeps a value from being re-joined on every pass.
 func (p *tracePass) joinAct(ctx context.Context, name string) (context.Context, trace.Span) {
-	if p.tracer == nil || p.d.Mode != tracecontext.Parent || p.actJoined {
+	if p.tracer == nil {
+		return ctx, trace.SpanFromContext(context.Background())
+	}
+	if p.d.Mode != tracecontext.Parent || p.actJoined {
+		// No step span for this act, but the pass DID act: mark the root (AttrActed), so a tail
+		// sampler keeps the record of the change. A joined act is marked by StartActStep itself.
+		tracecontext.MarkActed(ctx)
 		return ctx, trace.SpanFromContext(context.Background())
 	}
 	p.actJoined = true
