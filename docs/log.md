@@ -11,6 +11,15 @@ timestamp: 2026-08-07T00:00:00Z
 
 Curated history (newest first); release notes stay on the git tags.
 
+- **2026-11-13 — CPU saturation step measured over a 10s window (#82)**: ported
+  provider-runtime v1.19.0's step. Pressure is the share of the last 10s in
+  which some task waited for CPU, from cpu.pressure's cumulative `some total`,
+  not the kernel's `avg10` (a 10s exponential average that kept one stall over
+  the threshold for several 1s samples and halved capacity several times,
+  16→1). A cut needs a whole window of evidence and the next a window after
+  it; after a CPU cut capacity rises +1 per `StartupRampInterval` (2s), not
+  per `RecoveryInterval`. The threshold keeps its name and default (50), now
+  the 10s share. Opt-in rule (off by default in core-provider).
 - **2026-08 — `v1.4.0`, module identity migration**: Go module path moved to
   `github.com/krateo-platformops/unstructured-runtime` (full org
   independence); OTLP log export (tee slog handler + `SetupOTLPLogs`).
