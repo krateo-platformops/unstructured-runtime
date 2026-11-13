@@ -181,10 +181,11 @@ func (g *aimd) Start(ctx context.Context) error {
 // sample takes one reading and publishes the next local capacity. The file is read BEFORE g.mu is
 // taken, so TryAcquire never waits on I/O.
 func (g *aimd) sample() {
-	r := g.sat.read()
+	now := g.opts.Now()
+	r := g.sat.read(now)
 	g.mu.Lock()
 	cur := g.local.Load()
-	next := g.sat.step(g.opts.Now(), r, *cur, g.opts.Ceiling, g.opts.RecoveryInterval)
+	next := g.sat.step(now, r, *cur, g.opts.Ceiling)
 	if next != *cur {
 		g.local.Store(&next)
 		if next.capacity != cur.capacity {

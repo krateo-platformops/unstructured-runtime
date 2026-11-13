@@ -286,7 +286,7 @@ func newMetrics(meter metric.Meter, log logging.Logger, deploymentName string) (
 		return nil, err
 	}
 	if m.saturationInput, err = meter.Float64ObservableGauge("unstructured_runtime.ratelimit.saturation.input",
-		metric.WithDescription("The saturation input's last value: PSI some avg10 for cpu_pressure. Not reported while the input is disabled."),
+		metric.WithDescription("The saturation input's last value: for cpu_pressure, the share of the last 10s in which some task waited for CPU (from cpu.pressure \"some total\"). Not reported while the input is disabled."),
 		metric.WithUnit("%")); err != nil {
 		return nil, err
 	}

@@ -10,11 +10,11 @@ import (
 // tests for the CPU input.
 
 type fakeReader struct {
-	r     reading
+	r     rawSample
 	reads int
 }
 
-func (f *fakeReader) read() reading { f.reads++; return f.r }
+func (f *fakeReader) read() rawSample { f.reads++; return f.r }
 
 type satClock struct{ t time.Time }
 
@@ -29,7 +29,7 @@ func satGovernor(t *testing.T, ceiling int) (*aimd, *fakeReader, *satClock) {
 		t.Fatal(err)
 	}
 	a := g.(*aimd)
-	fr := &fakeReader{r: clean}
+	fr := &fakeReader{r: rawSample{cpu: reading{enabled: true}}}
 	a.sat.reader = fr
 	return a, fr, c
 }

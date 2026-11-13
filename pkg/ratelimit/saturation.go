@@ -17,27 +17,38 @@ import (
 )
 
 // Saturation: the controller's own CPU saturation as a second input to the governor, beside the
-// rate-limit signals (#66). Mirrored from provider-runtime v1.9.1 (pkg/ratelimit/saturation.go,
-// 06f9ae1), CPU pressure only: provider-runtime's experimental memory working-set input is NOT
-// ported, because its own re-measurement found it prevented OOMKills in 0 of 19 runs.
+// rate-limit signals (#66). Mirrored from provider-runtime v1.19.0 (pkg/ratelimit/saturation.go, the
+// CPU step of provider-runtime#95), CPU pressure only: provider-runtime's experimental memory
+// working-set input is NOT ported, because its own re-measurement found it prevented OOMKills in 0
+// of 19 runs.
 //
 // With saturation enabled, every gated pass needs a slot in a process-wide LOCAL capacity, whether
-// or not the handler implements a RateLimitKeyer. Local capacity starts at 1, rises by one per
-// StartupRampInterval until its first cut, and after any cut rises by one per clean RecoveryInterval
-// (the same rule as for API limits), up to the ceiling. A sample whose CPU pressure is over the
-// threshold is a cut: capacity halves, minimum 1.
+// or not the handler implements a RateLimitKeyer. Local capacity starts at 1 and rises by one per
+// clean StartupRampInterval, up to the ceiling. CPU pressure over the threshold for a whole
+// CPUPressureWindow halves it, minimum 1, at most once per window.
+//
+// #82: until v1.19.0's port this halved on every 1s sample of cpu.pressure "some avg10". avg10 is an
+// exponential average with a 10s time constant, so one stall stayed over the threshold for several
+// samples and cut several times (16 to 1), and recovery was +1 per 30s; provider-runtime measured
+// the old rule settling at ~72% of a 250m limit with 31% less throughput.
 const (
-	// DefaultSamplePeriod is how often the sampler reads the cgroup files. CPU pressure's "avg10" is
-	// already a 10-second average, so a faster sample gains nothing and costs CPU in the container
-	// it protects.
+	// DefaultSamplePeriod is how often the sampler reads the cgroup files. CPU pressure is measured
+	// over CPUPressureWindow, so a faster sample gains little and costs CPU in the container it
+	// protects.
 	DefaultSamplePeriod = time.Second
-	// DefaultStartupRampInterval is how long local capacity waits between steps of +1 from the start
-	// until its first cut.
+	// DefaultStartupRampInterval is how long local capacity waits between steps of +1, from the start
+	// and after a CPU cut, so 16 workers are all admitted after about 30s.
 	DefaultStartupRampInterval = 2 * time.Second
-	// DefaultCPUPressureThreshold is the cpu.pressure "some avg10" percentage above which the
-	// controller counts as CPU-saturated. PROVISIONAL: provider-runtime measured it on a synthetic
-	// load at a 250m limit, and core-provider is measuring it on the cdc (#66).
+	// DefaultCPUPressureThreshold is the CPU pressure percentage above which the controller counts as
+	// CPU-saturated: the share of the last CPUPressureWindow in which some task of the container
+	// waited for CPU. Over means strictly greater. PROVISIONAL (#66).
 	DefaultCPUPressureThreshold = 50.0
+	// CPUPressureWindow is the time CPU pressure is measured over, from the change of cpu.pressure's
+	// cumulative "some total" counter, and the least time between two CPU cuts. A cut needs a whole
+	// window of evidence, and the next one a whole window measured after it, so no cut is made twice
+	// on the same stall. The kernel's "avg10" is not used: it still holds most of a stall 10s after
+	// it ended (#82).
+	CPUPressureWindow = 10 * time.Second
 
 	// InputCPUPressure names the one saturation input, as reported in snapshots.
 	InputCPUPressure = "cpu_pressure"
@@ -60,13 +71,14 @@ type SaturationOptions struct {
 	// SamplePeriod is how often the files are read. Defaults to DefaultSamplePeriod.
 	SamplePeriod time.Duration
 
-	// StartupRampInterval is the time between steps of +1 from the start until the first cut.
+	// StartupRampInterval is the time between steps of +1, from the start and after a CPU cut.
 	// Defaults to DefaultStartupRampInterval. A step happens on the first sample after the interval
 	// has passed, so a longer SamplePeriod sets the pace.
 	StartupRampInterval time.Duration
 
-	// CPUPressureThreshold is the cpu.pressure "some avg10" percentage, in (0, 100], above which the
-	// controller is saturated. Defaults to DefaultCPUPressureThreshold.
+	// CPUPressureThreshold is the CPU pressure percentage, in (0, 100], above which the controller is
+	// saturated: the share of the last CPUPressureWindow in which some task waited for CPU, from
+	// cpu.pressure's "some total". Defaults to DefaultCPUPressureThreshold.
 	CPUPressureThreshold float64
 }
 
@@ -103,10 +115,30 @@ type reading struct {
 
 func disabled(why string) reading { return reading{disabledBecause: why} }
 
+// rawSample is one read of the cgroup files: whether CPU pressure is available, and its cumulative
+// "some total" stall. saturation.read turns the stall into the window's share.
+type rawSample struct {
+	cpu   reading
+	stall time.Duration
+}
+
+// cpuSample is one sample as the step sees it: the stall share over the window, and whether that
+// share covers a whole CPUPressureWindow.
+type cpuSample struct {
+	reading
+	confirmed bool
+}
+
+// stallPoint is cpu.pressure's cumulative stall at one sample.
+type stallPoint struct {
+	at    time.Time
+	total time.Duration
+}
+
 // cgroupReader reads one sample. It is the only part that does I/O, and only the sampler goroutine
 // calls it.
 type cgroupReader interface {
-	read() reading
+	read() rawSample
 }
 
 // localState is the process-wide local capacity the sampler publishes. It is replaced, never
@@ -115,8 +147,9 @@ type localState struct {
 	capacity int
 	// cause names what made the last sample saturated. A clean sample clears it.
 	cause string
-	// ramping is true from the start until the first cut, or until capacity reaches the ceiling,
-	// whichever comes first. A local deferral is a DeferRamping only while it is true.
+	// ramping is true from the start until the first sample over the threshold (whether or not it
+	// cut), or until capacity reaches the ceiling, whichever comes first. A local deferral is a
+	// DeferRamping only while it is true.
 	ramping bool
 }
 
@@ -134,8 +167,14 @@ type saturation struct {
 	// lastStep is when capacity last changed or a sample was last saturated; zero until the first
 	// sample.
 	lastStep time.Time
-	// cut is set by the first saturated sample, and ends the startup ramp.
-	cut bool
+	// saturatedOnce is set by the first sample over the threshold, cut or not, and ends the startup
+	// ramp.
+	saturatedOnce bool
+	// stall is the cumulative CPU stall at the samples of the last CPUPressureWindow, oldest first;
+	// its first point is the window's start.
+	stall []stallPoint
+	// lastCPUCut is when CPU pressure last cut capacity; zero until it has.
+	lastCPUCut time.Time
 }
 
 func newSaturation(o SaturationOptions, log logging.Logger) (*saturation, error) {
@@ -153,56 +192,85 @@ func newSaturation(o SaturationOptions, log logging.Logger) (*saturation, error)
 	return &saturation{opts: o, dir: dir, reader: cgroupFiles{dir: dir}, log: log}, nil
 }
 
-// read takes one sample, publishes it, and logs the input the first time it is found disabled.
-func (s *saturation) read() reading {
-	r := s.reader.read()
+// read takes one sample at now, turns the cumulative CPU stall into its share of the window,
+// publishes it, and logs the input the first time it is found disabled.
+func (s *saturation) read(now time.Time) cpuSample {
+	raw := s.reader.read()
+	smp := cpuSample{reading: raw.cpu}
+	if smp.enabled {
+		smp.percent, smp.confirmed = s.stallShare(now, raw.stall)
+	} else {
+		s.stall = nil
+	}
+	r := smp.reading
 	s.last.Store(&r)
 	if !r.enabled && !s.loggedDisabled {
 		s.loggedDisabled = true
 		s.log.Info("Saturation input disabled; the governor's local capacity stays where it is",
 			"input", InputCPUPressure, "reason", r.disabledBecause, "cgroup", s.dir)
 	}
-	return r
+	return smp
 }
 
-// step returns the local state that follows cur after reading r, taken at now. The first call only
+// stallShare records the cumulative CPU stall read at now and returns the percentage of time stalled
+// since the window's start, and whether that span is a whole CPUPressureWindow. The window's start
+// is the latest sample at least a window old, or the first sample while there is none. A counter that
+// went backwards belongs to another cgroup, and starts the window again.
+func (s *saturation) stallShare(now time.Time, total time.Duration) (percent float64, confirmed bool) {
+	if n := len(s.stall); n > 0 && total < s.stall[n-1].total {
+		s.stall = nil
+	}
+	if n := len(s.stall); n == 0 || now.After(s.stall[n-1].at) {
+		s.stall = append(s.stall, stallPoint{at: now, total: total})
+	}
+	for len(s.stall) > 1 && now.Sub(s.stall[1].at) >= CPUPressureWindow {
+		s.stall = s.stall[1:]
+	}
+	start := s.stall[0]
+	span := now.Sub(start.at)
+	if span <= 0 {
+		return 0, false
+	}
+	return min(100, 100*float64(total-start.total)/float64(span)), span >= CPUPressureWindow
+}
+
+// step returns the local state that follows cur after sample smp, taken at now. The first call only
 // starts the clock.
 //
-//   - CPU pressure over the threshold: a cut, capacity halves, minimum 1. step runs once per sample,
-//     so this halves at most once per sample period.
-//   - A clean sample: capacity +1, up to ceiling, once enough time has passed since the last step or
-//     saturated sample. Until the first cut that time is StartupRampInterval, so a restarted
-//     controller eases into its backlog. After any cut it is the recovery interval.
-//
-// A saturated sample counts as a cut EVEN AT THE FLOOR, where capacity cannot fall further: it ends
-// the startup ramp and restarts the clean interval (provider-runtime's third trap).
-func (s *saturation) step(now time.Time, r reading, cur localState, ceiling int, recovery time.Duration) localState {
+//   - CPU pressure over the threshold: capacity halves, minimum 1, if the pressure covers a whole
+//     CPUPressureWindow and the last CPU cut is at least a window old. Otherwise capacity holds: the
+//     stall isn't confirmed yet, or it is the one the last cut already answered. Either way the
+//     sample is not clean: it restarts the clean interval and ends the startup ramp, EVEN AT THE
+//     FLOOR (provider-runtime's third trap).
+//   - A clean sample: capacity +1, up to ceiling, once StartupRampInterval has passed since the last
+//     step or over-threshold sample, from the start and after a CPU cut (provider-runtime v1.19.0:
+//     recovery after a CPU cut is the ramp interval, not RecoveryInterval).
+func (s *saturation) step(now time.Time, smp cpuSample, cur localState, ceiling int) localState {
 	if s.lastStep.IsZero() {
 		s.lastStep = now
 	}
 	next := cur
-	if saturated, cause := s.evaluate(r); saturated {
-		next.capacity = max(capacityFloor, cur.capacity/2)
+	if over, cause := s.evaluate(smp.reading); over {
 		next.cause = cause
-		s.cut, s.lastStep = true, now
+		s.saturatedOnce, s.lastStep = true, now
+		if smp.confirmed && (s.lastCPUCut.IsZero() || now.Sub(s.lastCPUCut) >= CPUPressureWindow) {
+			next.capacity = max(capacityFloor, cur.capacity/2)
+			s.lastCPUCut = now
+		}
 	} else {
 		next.cause = ""
-		wait := s.opts.StartupRampInterval
-		if s.cut {
-			wait = recovery
-		}
-		if cur.capacity < ceiling && now.Sub(s.lastStep) >= wait {
+		if cur.capacity < ceiling && now.Sub(s.lastStep) >= s.opts.StartupRampInterval {
 			next.capacity = cur.capacity + 1
 			s.lastStep = now
 		}
 	}
-	next.ramping = !s.cut && next.capacity < ceiling
+	next.ramping = !s.saturatedOnce && next.capacity < ceiling
 	return next
 }
 
 func (s *saturation) evaluate(r reading) (saturated bool, cause string) {
 	if r.enabled && r.percent > s.opts.CPUPressureThreshold {
-		return true, "CPU pressure " + strconv.FormatFloat(r.percent, 'f', 0, 64) + "% (some avg10)"
+		return true, "CPU pressure " + strconv.FormatFloat(r.percent, 'f', 0, 64) + "% (some, over " + CPUPressureWindow.String() + ")"
 	}
 	return false, ""
 }
@@ -226,25 +294,33 @@ type InputSnapshot struct {
 	// Enabled is false when the input is missing (no cgroup v2, no PSI) or saturation is off. A
 	// disabled input has no Percent: zero would read as healthy.
 	Enabled bool
-	// Percent is cpu.pressure "some avg10".
+	// Percent is the share of the last CPUPressureWindow in which some task waited for CPU, from
+	// cpu.pressure's "some total" (#82; it was "some avg10").
 	Percent float64
 }
 
 type cgroupFiles struct{ dir string }
 
-func (c cgroupFiles) read() reading {
+func (c cgroupFiles) read() rawSample {
 	root, err := os.OpenRoot(c.dir)
 	if err != nil {
-		return disabled("no cgroup v2 directory at " + c.dir + ": " + err.Error())
+		return rawSample{cpu: disabled("no cgroup v2 directory at " + c.dir + ": " + err.Error())}
 	}
 	defer func() { _ = root.Close() }()
-	return readPressure(root, "cpu.pressure", "some")
+	r, stall := readPressure(root, "cpu.pressure", "some")
+	return rawSample{cpu: r, stall: stall}
 }
 
-func readPressure(root *os.Root, file, line string) reading {
+// readPressure returns total, the cumulative stall in microseconds, of the given line ("some" or
+// "full") of a PSI file such as cpu.pressure:
+//
+//	some avg10=1.53 avg60=0.87 avg300=0.24 total=1234567
+//
+// The reading is enabled with no percent: saturation.read derives it from the change in the total.
+func readPressure(root *os.Root, file, line string) (reading, time.Duration) {
 	b, err := root.ReadFile(file)
 	if err != nil {
-		return disabled(missingWhy(file, err))
+		return disabled(missingWhy(file, err)), 0
 	}
 	sc := bufio.NewScanner(bytes.NewReader(b))
 	for sc.Scan() {
@@ -253,19 +329,22 @@ func readPressure(root *os.Root, file, line string) reading {
 			continue
 		}
 		for _, f := range fields[1:] {
-			v, ok := strings.CutPrefix(f, "avg10=")
+			v, ok := strings.CutPrefix(f, "total=")
 			if !ok {
 				continue
 			}
-			p, err := strconv.ParseFloat(v, 64)
-			if err != nil || p < 0 {
-				return disabled(file + ": cannot parse " + strconv.Quote(f))
+			us, err := strconv.ParseInt(v, 10, 64)
+			if err != nil || us < 0 || us > int64(maxStall/time.Microsecond) {
+				return disabled(file + ": cannot parse " + strconv.Quote(f)), 0
 			}
-			return reading{enabled: true, percent: p}
+			return reading{enabled: true}, time.Duration(us) * time.Microsecond
 		}
 	}
-	return disabled(file + ": no " + strconv.Quote(line) + " avg10 value")
+	return disabled(file + ": no " + strconv.Quote(line) + " total value"), 0
 }
+
+// maxStall is the largest cumulative stall a time.Duration holds, about 292 years.
+const maxStall = time.Duration(1<<63 - 1)
 
 func missingWhy(file string, err error) string {
 	if errors.Is(err, fs.ErrNotExist) {
