@@ -53,6 +53,10 @@ type options struct {
 
 	// tracerProvider is controller.Options.TracerProvider; nil => the process default.
 	tracerProvider trace.TracerProvider
+
+	// ownership is the Lease the controller must hold to reconcile; nil => none. Build fills in
+	// its Leases client from the Configuration's rest.Config.
+	ownership *controller.Ownership
 }
 
 func defaultOptions() options {
@@ -99,6 +103,17 @@ func WithNamespace(ns string) func(o *options) {
 func WithGracefulShutdownTimeout(d time.Duration) func(o *options) {
 	return func(o *options) {
 		o.gracefulShutdownTimeout = &d
+	}
+}
+
+// WithOwnership makes the controller reconcile only while it holds the coordination.k8s.io Lease
+// namespace/name, as identity (the pod name), so that a second process for the same resource waits
+// instead of reconciling alongside. Every process that may reconcile the same resource must be given
+// the same Lease. The ServiceAccount needs get, create and update on that Lease. See
+// controller.Ownership for what Run does with it.
+func WithOwnership(namespace, name, identity string) func(o *options) {
+	return func(o *options) {
+		o.ownership = &controller.Ownership{Namespace: namespace, Name: name, Identity: identity}
 	}
 }
 
