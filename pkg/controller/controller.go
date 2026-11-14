@@ -111,8 +111,10 @@ type CreateResult struct {
 //
 // Implement this on such a client. The runtime calls CreateWithResult INSTEAD of Create. On a nil
 // error with Requested false, the runtime:
-//   - clears krateo.io/external-create-pending, which it set before the call, because no create is
-//     in flight;
+//   - closes krateo.io/external-create-pending (set before the call) with
+//     krateo.io/external-create-not-requested, without deleting it: a deletion fires the builder's
+//     OnDelete Create trigger, so the next pass would start at once (oasgen-provider#674); the next
+//     pass waits for the normal resync instead;
 //   - does not stamp krateo.io/external-create-succeeded;
 //   - emits no CreatedExternalResource event;
 //   - sets Synced to ReconcileSuccess, and leaves Ready as the client persisted it.

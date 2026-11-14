@@ -1398,7 +1398,12 @@ func (c *Controller) createNotRequested(ctx context.Context, ref objectref.Objec
 		log.Error(err, "Cannot fetch managed resource")
 		return err
 	}
-	meta.RemoveAnnotations(el, meta.AnnotationKeyExternalCreatePending)
+	// The pending marker is CLOSED, not deleted: deleting external-create-pending fires the builder's
+	// OnDelete watch, which enqueues a Create immediately, so every not-requested pass scheduled the
+	// next one with no rate limit (~5 metadata writes a second per object, oasgen-provider#674). A
+	// not-requested timestamp ends ExternalCreateIncomplete as succeeded and failed do, changes no
+	// watched annotation, and the next pass waits for the normal resync.
+	meta.SetExternalCreateNotRequested(el, time.Now())
 	if el, uerr := tools.Update(ctx, el, tools.UpdateOptions{
 		Pluralizer:    c.pluralizer,
 		DynamicClient: c.dynamicClient,
