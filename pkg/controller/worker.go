@@ -1249,7 +1249,7 @@ func (c *Controller) handleCreate(ctx context.Context, ref objectref.ObjectRef) 
 	if merr != nil {
 		return merr
 	}
-	actionErr := c.externalClient.Create(actCtx, el)
+	created, actionErr := c.create(actCtx, el)
 	telemetry.RecordSpanError(act, actionErr)
 	act.End()
 	if c.metrics != nil {
@@ -1306,6 +1306,10 @@ func (c *Controller) handleCreate(ctx context.Context, ref objectref.ObjectRef) 
 		}
 
 		return actionErr
+	}
+
+	if !created.Requested {
+		return c.createNotRequested(ctx, ref, created.Reason)
 	}
 
 	el, err = c.fetch(ctx, ref, false)
@@ -1371,6 +1375,60 @@ func (c *Controller) handleCreate(ctx context.Context, ref objectref.ObjectRef) 
 		return err
 	}
 	c.recordEvent(el, event.Normal(reasonCreated, actionCreateEvent, "Successfully requested creation of external resource"))
+	return nil
+}
+
+// create calls the client's create: CreateWithResult when it is a ResultCreator, otherwise Create,
+// whose nil return means a create was requested.
+func (c *Controller) create(ctx context.Context, el *unstructured.Unstructured) (CreateResult, error) {
+	if rc, ok := c.externalClient.(ResultCreator); ok {
+		return rc.CreateWithResult(ctx, el)
+	}
+	return CreateResult{Requested: true}, c.externalClient.Create(ctx, el)
+}
+
+// createNotRequested ends a create pass whose client reported that it requested nothing
+// (ResultCreator). No create is in flight, so external-create-pending is cleared. Nothing is recorded
+// as created: no external-create-succeeded and no CreatedExternalResource event. Synced records the
+// pass as successful, and Ready is left as the client persisted it.
+func (c *Controller) createNotRequested(ctx context.Context, ref objectref.ObjectRef, reason string) error {
+	log := contextutils.Logger(ctx).WithValues("event", "create").WithValues("traceId", contextutils.TraceId(ctx, false))
+
+	el, err := c.fetch(ctx, ref, false)
+	if err != nil {
+		log.Error(err, "Cannot fetch managed resource")
+		return err
+	}
+	meta.RemoveAnnotations(el, meta.AnnotationKeyExternalCreatePending)
+	if el, uerr := tools.Update(ctx, el, tools.UpdateOptions{
+		Pluralizer:    c.pluralizer,
+		DynamicClient: c.dynamicClient,
+	}); uerr != nil {
+		log.Error(uerr, errUpdateManagedAnnotations)
+		c.recordEvent(el, event.Warning(reasonCannotUpdateManaged, actionUpdateManagedResource, errors.Wrap(uerr, errUpdateManagedAnnotations)))
+		return errors.Wrap(uerr, errUpdateManagedAnnotations)
+	}
+
+	log.Info("External create not requested by the client; nothing recorded as created", "reason", reason)
+
+	el, err = c.fetch(ctx, ref, false)
+	if err != nil {
+		log.Error(err, "Cannot fetch managed resource")
+		return err
+	}
+	if err := unstructuredtools.SetConditions(el, condition.ReconcileSuccess()); err != nil {
+		log.Error(err, "Cannot set conditions")
+		c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))
+		return err
+	}
+	if el, err = tools.PatchStatusConditions(ctx, el, tools.UpdateOptions{
+		Pluralizer:    c.pluralizer,
+		DynamicClient: c.dynamicClient,
+	}); err != nil {
+		log.Error(err, "Cannot update status")
+		c.recordEvent(el, event.Warning(reasonCannotUpdateManaged, actionUpdateManagedResource, err))
+		return err
+	}
 	return nil
 }
 
