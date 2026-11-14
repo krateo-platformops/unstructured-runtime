@@ -722,6 +722,22 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 			return rerr
 		}
 		lg.Info("Recovered from incomplete external create", "resourceExists", resourceExists)
+
+		// The create this event asks for has already landed: the recovery just observed the
+		// resource and recorded it as created. Dispatching the Create anyway calls the handler's
+		// Create a second time, in the same pass that established it was not needed. This is
+		// reached whenever a create's status write lost a race: the quiet requeue re-adds the
+		// Create event unchanged, and the next pass recovers here. A handler whose create is not
+		// idempotent then makes a duplicate external resource. One that refuses (409 "already
+		// exists") reports the refusal as a create failure, which is what keycloak-provider-kog
+		// measured: six creates in three minutes against a client that existed from the first
+		// (oasgen-provider#676). Observe instead: it sees the resource and updates it if it
+		// drifted. A recovery that found the resource absent (pending removed after the grace
+		// period) still dispatches the Create, because then it is needed.
+		if resourceExists && evt.EventType == ctrlevent.Create {
+			lg.Debug("Dispatching the recovered Create as Observe: the resource exists")
+			evt.EventType = ctrlevent.Observe
+		}
 	}
 
 	if !meta.WasDeleted(el) {
