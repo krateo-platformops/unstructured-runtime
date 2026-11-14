@@ -181,9 +181,30 @@ func (c *Controller) observeOwnership(err error, holder string, seen bool) {
 			"lease", c.ownership.describe(), "identity", c.ownership.Identity)
 		return
 	}
-	if changed && holder != c.ownership.Identity {
-		c.logger.Info("Ownership lease is held by another process; waiting for it",
-			"lease", c.ownership.describe(), "holder", holder, "previousHolder", prev, "identity", c.ownership.Identity)
+	if msg := holderChangeMessage(c.ownership.Identity, holder, prev, changed); msg != "" {
+		c.logger.Info(msg, "lease", c.ownership.describe(), "holder", holder, "previousHolder", prev, "identity", c.ownership.Identity)
+	}
+}
+
+const (
+	msgLeaseHeldByAnother = "Ownership lease is held by another process; waiting for it"
+	msgLeaseReleased      = "Ownership lease was released; taking it on the next attempt"
+)
+
+// holderChangeMessage is the log line for a newly seen holder, or "" for none. client-go releases a
+// Lease by clearing its holder, so an empty holder is a release, never a holder named "". Our own
+// acquisition and release are logged where they happen (acquireOwnership), not here.
+func holderChangeMessage(identity, holder, prev string, changed bool) string {
+	switch {
+	case !changed || holder == identity:
+		return ""
+	case holder == "":
+		if prev == identity {
+			return ""
+		}
+		return msgLeaseReleased
+	default:
+		return msgLeaseHeldByAnother
 	}
 }
 
@@ -242,12 +263,16 @@ func (c *Controller) acquireOwnership(ctx context.Context) (context.Context, fun
 		stopElect()
 		<-done
 	}
+	releaseHeld := func() {
+		release()
+		c.logger.Info("Released the ownership lease", "lease", o.describe(), "identity", o.Identity)
+	}
 
 	c.logger.Info("Waiting for the ownership lease before reconciling", "lease", o.describe(), "identity", o.Identity)
 	select {
 	case lead := <-acquired:
 		c.logger.Info("Holding the ownership lease; starting workers", "lease", o.describe(), "identity", o.Identity)
-		return lead, release, nil
+		return lead, releaseHeld, nil
 	case <-ctx.Done():
 		release()
 		c.logger.Info("Stopped before taking the ownership lease; nothing was reconciled", "lease", o.describe())
