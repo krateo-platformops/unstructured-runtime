@@ -142,3 +142,38 @@ func TestHandleCreate_NotRequestedWithAnError_TakesTheErrorPath(t *testing.T) {
 	require.NotContains(t, pass.obj.GetAnnotations(), meta.AnnotationKeyExternalCreateSucceeded)
 	require.NotContains(t, pass.events, string(reasonCreated))
 }
+
+// A permanent refusal states its own Synced through CreateResult.Conditions, and the runtime does not
+// replace it with its default (the Observe rule, core-provider#241). Without this, a resource that
+// will never exist would read Synced=True.
+func TestHandleCreate_NotRequested_ClientSyncedIsNotOverridden(t *testing.T) {
+	refusal := []metav1.Condition{
+		{Type: condition.TypeReady, Status: metav1.ConditionFalse, Reason: "NoCreateVerbDeclared", Message: "the definition declares no create verb", LastTransitionTime: metav1.Now()},
+		{Type: condition.TypeSynced, Status: metav1.ConditionFalse, Reason: "NoCreateVerbDeclared", Message: "the definition declares no create verb", LastTransitionTime: metav1.Now()},
+	}
+	pass := runCreate(t, "refused-synced", func(o Options) ExternalClient {
+		return &resultCreator{t: t, dyn: o.Client, gvr: o.GVR, result: CreateResult{Requested: false, Reason: "NoCreateVerbDeclared", Conditions: refusal}}
+	})
+	require.NoError(t, pass.err)
+	for _, typ := range []string{condition.TypeReady, condition.TypeSynced} {
+		c := conditionOf(t, pass.obj, typ)
+		require.NotNil(t, c, typ)
+		require.Equal(t, metav1.ConditionFalse, c.Status, typ)
+		require.Equal(t, "NoCreateVerbDeclared", c.Reason, typ)
+	}
+	require.NotContains(t, pass.obj.GetAnnotations(), meta.AnnotationKeyExternalCreateSucceeded)
+}
+
+// The same rule on a requested create: the client's Conditions are applied, and a client Synced wins.
+func TestHandleCreate_Requested_ClientConditionsApplied(t *testing.T) {
+	pass := runCreate(t, "requested-conds", func(o Options) ExternalClient {
+		return &resultCreator{t: t, dyn: o.Client, gvr: o.GVR, result: CreateResult{Requested: true, Conditions: []metav1.Condition{
+			{Type: condition.TypeSynced, Status: metav1.ConditionFalse, Reason: "AsyncCreateAccepted", LastTransitionTime: metav1.Now()},
+		}}}
+	})
+	require.NoError(t, pass.err)
+	c := conditionOf(t, pass.obj, condition.TypeSynced)
+	require.NotNil(t, c)
+	require.Equal(t, "AsyncCreateAccepted", c.Reason)
+	require.Contains(t, pass.obj.GetAnnotations(), meta.AnnotationKeyExternalCreateSucceeded)
+}

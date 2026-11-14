@@ -1318,7 +1318,7 @@ func (c *Controller) handleCreate(ctx context.Context, ref objectref.ObjectRef) 
 	}
 
 	if !created.Requested {
-		return c.createNotRequested(ctx, ref, created.Reason)
+		return c.createNotRequested(ctx, ref, created)
 	}
 
 	el, err = c.fetch(ctx, ref, false)
@@ -1368,8 +1368,7 @@ func (c *Controller) handleCreate(ctx context.Context, ref objectref.ObjectRef) 
 		log.Error(err, "Cannot fetch managed resource")
 		return err
 	}
-	err = unstructuredtools.SetConditions(el, condition.ReconcileSuccess())
-	if err != nil {
+	if err := setCreateConditions(el, created.Conditions); err != nil {
 		log.Error(err, "Cannot set conditions")
 		c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))
 		return err
@@ -1391,7 +1390,7 @@ func (c *Controller) handleCreate(ctx context.Context, ref objectref.ObjectRef) 
 // (ResultCreator). No create is in flight, so external-create-pending is cleared. Nothing is recorded
 // as created: no external-create-succeeded and no CreatedExternalResource event. Synced records the
 // pass as successful, and Ready is left as the client persisted it.
-func (c *Controller) createNotRequested(ctx context.Context, ref objectref.ObjectRef, reason string) error {
+func (c *Controller) createNotRequested(ctx context.Context, ref objectref.ObjectRef, created CreateResult) error {
 	log := contextutils.Logger(ctx).WithValues("event", "create").WithValues("traceId", contextutils.TraceId(ctx, false))
 
 	el, err := c.fetch(ctx, ref, false)
@@ -1409,14 +1408,14 @@ func (c *Controller) createNotRequested(ctx context.Context, ref objectref.Objec
 		return errors.Wrap(uerr, errUpdateManagedAnnotations)
 	}
 
-	log.Info("External create not requested by the client; nothing recorded as created", "reason", reason)
+	log.Info("External create not requested by the client; nothing recorded as created", "reason", created.Reason)
 
 	el, err = c.fetch(ctx, ref, false)
 	if err != nil {
 		log.Error(err, "Cannot fetch managed resource")
 		return err
 	}
-	if err := unstructuredtools.SetConditions(el, condition.ReconcileSuccess()); err != nil {
+	if err := setCreateConditions(el, created.Conditions); err != nil {
 		log.Error(err, "Cannot set conditions")
 		c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))
 		return err
@@ -1679,6 +1678,22 @@ func (c *Controller) recordEvent(obj runtime.Object, e event.Event) {
 	}
 
 	c.throttledRecorder.Event(obj, e)
+}
+
+// setCreateConditions records a nil-error create's conditions on el: the client's own (CreateResult.
+// Conditions, upserted by Type), then the runtime's default Synced=ReconcileSuccess only when the
+// client gave no Synced. The same rule as Observe's (core-provider#241): the client's statement about
+// its own convergence is more specific than the runtime's default.
+func setCreateConditions(el *unstructured.Unstructured, conds []metav1.Condition) error {
+	if len(conds) > 0 {
+		if err := unstructuredtools.SetConditions(el, conds...); err != nil {
+			return err
+		}
+	}
+	if hasConditionType(conds, condition.TypeSynced) {
+		return nil
+	}
+	return unstructuredtools.SetConditions(el, condition.ReconcileSuccess())
 }
 
 // hasConditionType reports whether conds contains a condition of type t.
