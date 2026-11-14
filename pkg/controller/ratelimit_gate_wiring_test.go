@@ -59,6 +59,30 @@ func externalClientCall(call *ast.CallExpr) bool {
 	return ok && id.Name == "c"
 }
 
+// externalCapabilities are the optional interfaces whose methods call the external system. A call
+// through one is made on a value type-asserted from c.externalClient (rc, ok :=
+// c.externalClient.(ResultCreator); rc.CreateWithResult(...)), which externalClientCall cannot see,
+// so the assertion itself counts as the external-client access. ratelimit.RateLimitKeyer is NOT
+// one: it only reads the key the gate limits on. A new capability interface belongs here.
+var externalCapabilities = map[string]bool{"ExistenceChecker": true, "ResultCreator": true}
+
+// capabilityAssertion reports whether n is c.externalClient.(T) for an external capability T.
+func capabilityAssertion(n ast.Node) bool {
+	ta, ok := n.(*ast.TypeAssertExpr)
+	if !ok || ta.Type == nil {
+		return false
+	}
+	inner, ok := ta.X.(*ast.SelectorExpr)
+	if !ok || inner.Sel.Name != "externalClient" {
+		return false
+	}
+	if id, ok := inner.X.(*ast.Ident); !ok || id.Name != "c" {
+		return false
+	}
+	t, ok := ta.Type.(*ast.Ident)
+	return ok && externalCapabilities[t.Name]
+}
+
 func TestRateLimitGateIsTheOnlyWayToTheExternalClient(t *testing.T) {
 	files, err := filepath.Glob("*.go")
 	if err != nil {
@@ -93,6 +117,10 @@ func TestRateLimitGateIsTheOnlyWayToTheExternalClient(t *testing.T) {
 			processItem = fd
 		}
 		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			if capabilityAssertion(n) {
+				clientCallers[fd.Name.Name]++
+				return true
+			}
 			call, ok := n.(*ast.CallExpr)
 			if !ok {
 				return true

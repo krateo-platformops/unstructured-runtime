@@ -81,6 +81,49 @@ type ExistenceChecker interface {
 	Exists(ctx context.Context, mg *unstructured.Unstructured) (bool, error)
 }
 
+// CreateResult is what a create pass did, as a ResultCreator reports it.
+type CreateResult struct {
+	// Requested: the client asked the external system to create the resource, synchronously or
+	// asynchronously. False: it sent no create request, and nothing failed. For example the
+	// credential may not grant the create verb, or a referent the create needs may not exist yet.
+	Requested bool
+	// Reason says why nothing was requested, when Requested is false. It is logged.
+	Reason string
+	// Conditions the client wants recorded for this create, applied on a nil error exactly as
+	// ExternalObservation.Conditions are on Observe (core-provider#241): upserted by Type before the
+	// runtime's status write. The runtime then stamps its default Synced=ReconcileSuccess ONLY when
+	// they carry no Synced. A refusal that will not resolve without a person (no create verb, a
+	// credential that may not create) can say so, e.g. Ready=False and Synced=False with its own
+	// reason. A wait (an async create, a referent not yet present) can leave Synced to the default.
+	// Return them, don't write them: a status write from inside the call leaves the runtime's copy
+	// at a stale resourceVersion (core-provider#258). Nil and empty are equivalent.
+	Conditions []metav1.Condition
+}
+
+// A ResultCreator tells the runtime whether its create requested anything.
+//
+// Create returns only an error, so the runtime reads a nil return as "a create was requested". It
+// then stamps krateo.io/external-create-succeeded on the object and emits the Normal event
+// CreatedExternalResource. A client with paths that return nil WITHOUT requesting a create would
+// make both claims about a create that never happened. The false succeeded annotation would also
+// keep the object out of incomplete-create recovery (ExternalCreateIncomplete), the one mechanism
+// for a create whose result is unknown.
+//
+// Implement this on such a client. The runtime calls CreateWithResult INSTEAD of Create. On a nil
+// error with Requested false, the runtime:
+//   - clears krateo.io/external-create-pending, which it set before the call, because no create is
+//     in flight;
+//   - does not stamp krateo.io/external-create-succeeded;
+//   - emits no CreatedExternalResource event;
+//   - sets Synced to ReconcileSuccess, and leaves Ready as the client persisted it.
+//
+// The next pass observes again as usual. A non-nil error takes the create-error path whatever the
+// result says. Requested true is exactly a nil Create. A client that does not implement this
+// interface behaves exactly as before.
+type ResultCreator interface {
+	CreateWithResult(ctx context.Context, mg *unstructured.Unstructured) (CreateResult, error)
+}
+
 // An ExternalObservation is the result of an observation of an external resource.
 type ExternalObservation struct {
 	// ResourceExists must be true if a corresponding external resource exists

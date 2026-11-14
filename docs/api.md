@@ -27,6 +27,29 @@ The load-bearing packages:
     }
     ```
   - `ExternalObservation{ResourceExists, ResourceUpToDate bool}`
+  - **What a nil `Create` means.** The runtime reads a nil `Create` as "a create was requested". It
+    stamps `krateo.io/external-create-succeeded`, emits the Normal event `CreatedExternalResource`
+    and sets `Synced` to `ReconcileSuccess`. `Ready` is not written on that path, so a `Ready` the
+    client persisted before returning survives. A non-nil error sets `Ready=False/Creating` (with
+    the error) and `Synced` to `ReconcileError`, and stamps `krateo.io/external-create-failed`.
+  - `ResultCreator` (optional): a client whose create can return without requesting anything (for
+    example a credential lacking the create verb, or a referent not yet present) implements
+    `CreateWithResult(ctx, mg) (CreateResult, error)`, with
+    `CreateResult{Requested bool; Reason string; Conditions []metav1.Condition}`. The runtime calls it
+    instead of `Create`. With a nil error and `Requested: false`, the runtime clears
+    `external-create-pending`, does not stamp `external-create-succeeded`, emits no
+    `CreatedExternalResource` event, and leaves `Ready` as the client wrote it. The next pass observes
+    again. A non-nil error takes the error path whatever the result says. Without it, a nil return
+    would durably claim a create that never happened, and keep the object out of incomplete-create
+    recovery.
+  - `CreateResult.Conditions`, on either nil-error outcome, follow the same rule as
+    `ExternalObservation.Conditions`: they are upserted by Type, and the runtime stamps its default
+    `Synced=ReconcileSuccess` only when they carry no `Synced`. A refusal that will not resolve
+    without a person (no create verb, a credential that may not create) should return `Ready=False`
+    and `Synced=False` with its own reason. A wait (an async create, a referent not yet present) can
+    leave `Synced` to the default. Return conditions; don't write status from inside the call.
+  - `ExistenceChecker` (optional): `Exists(ctx, mg) (bool, error)`, preferred by incomplete-create
+    recovery over `Observe`.
   - `Options`, `New(sid, Options) (*Controller, error)`
   - `(*Controller).SetExternalClient`, `Run(ctx, numWorkers)`,
     `SetGracefulShutdownTimeout(d)`
