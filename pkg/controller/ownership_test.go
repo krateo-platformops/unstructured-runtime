@@ -244,3 +244,24 @@ func TestOwnership_Validate(t *testing.T) {
 		require.Error(t, o.validate(), name)
 	}
 }
+
+// client-go releases a Lease by clearing its holder. That must read as a release, not as a process
+// named "" holding it (the first version logged "held by another process" with holder="" on every
+// handover), and our own release must not be announced as someone else's.
+func TestOwnership_HolderChangeMessage(t *testing.T) {
+	for _, tc := range []struct {
+		name, holder, prev string
+		changed            bool
+		want               string
+	}{
+		{"unchanged", "pod-b", "pod-b", false, ""},
+		{"we took it", "pod-a", "", true, ""},
+		{"another holds it", "pod-b", "", true, msgLeaseHeldByAnother},
+		{"another released it", "", "pod-b", true, msgLeaseReleased},
+		{"we released it", "", "pod-a", true, ""},
+	} {
+		if got := holderChangeMessage("pod-a", tc.holder, tc.prev, tc.changed); got != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
