@@ -41,6 +41,15 @@ const (
 	// resource failed. Its value must be an RFC3999 timestamp.
 	AnnotationKeyExternalCreateFailed = "krateo.io/external-create-failed"
 
+	// AnnotationKeyExternalCreateNotRequested is the key in the annotations map of a resource that
+	// indicates the last time a create pass ended WITHOUT requesting a create (a ResultCreator
+	// returned Requested=false: no create verb, a referent not yet present, a refused credential).
+	// Its value must be an RFC3339 timestamp. It closes the pending marker the way succeeded and failed
+	// do, without deleting it: deleting external-create-pending fires the builder's OnDelete trigger,
+	// which enqueues a Create at once and turned every not-requested pass into the next one
+	// (oasgen-provider#674).
+	AnnotationKeyExternalCreateNotRequested = "krateo.io/external-create-not-requested"
+
 	// AnnotationKeyReconciliationPaused is the key in the annotations map
 	// of a resource that indicates that further reconciliations on the
 	// resource are paused. All create/update/delete/generic events on
@@ -258,25 +267,43 @@ func SetExternalCreateFailed(o metav1.Object, t time.Time) {
 	AddAnnotations(o, map[string]string{AnnotationKeyExternalCreateFailed: t.Format(time.RFC3339)})
 }
 
+// GetExternalCreateNotRequested returns the time at which a create pass most recently ended without
+// requesting a create.
+func GetExternalCreateNotRequested(o metav1.Object) time.Time {
+	a := o.GetAnnotations()[AnnotationKeyExternalCreateNotRequested]
+	t, err := time.Parse(time.RFC3339, a)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+// SetExternalCreateNotRequested sets the time at which a create pass most recently ended without
+// requesting a create.
+func SetExternalCreateNotRequested(o metav1.Object, t time.Time) {
+	AddAnnotations(o, map[string]string{AnnotationKeyExternalCreateNotRequested: t.Format(time.RFC3339)})
+}
+
 // ExternalCreateIncomplete returns true if creation of the external resource
 // appears to be incomplete. We deem creation to be incomplete if the 'external
 // create pending' annotation is the newest of all tracking annotations that are
-// set (i.e. pending, succeeded, and failed).
+// set (i.e. pending, succeeded, failed, and not-requested). Strictly newer: the
+// timestamps are second-granular, and a pass that ends in the same second it
+// started is complete.
 func ExternalCreateIncomplete(o metav1.Object) bool {
 	pending := GetExternalCreatePending(o)
-	succeeded := GetExternalCreateSucceeded(o)
-	failed := GetExternalCreateFailed(o)
 
 	// If creation never started it can't be incomplete.
 	if pending.IsZero() {
 		return false
 	}
 
-	latest := succeeded
-	if failed.After(succeeded) {
-		latest = failed
+	latest := GetExternalCreateSucceeded(o)
+	for _, t := range []time.Time{GetExternalCreateFailed(o), GetExternalCreateNotRequested(o)} {
+		if t.After(latest) {
+			latest = t
+		}
 	}
-
 	return pending.After(latest)
 }
 

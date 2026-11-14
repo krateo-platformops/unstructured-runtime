@@ -101,8 +101,10 @@ func TestHandleCreate_NotRequested_RecordsNoCreate(t *testing.T) {
 
 	ann := pass.obj.GetAnnotations()
 	require.NotContains(t, ann, meta.AnnotationKeyExternalCreateSucceeded, "a create that was not requested is recorded as succeeded")
-	require.NotContains(t, ann, meta.AnnotationKeyExternalCreatePending, "no create is in flight, yet external-create-pending is left set")
-	require.False(t, meta.ExternalCreateIncomplete(pass.obj))
+	// Closed, not deleted: deleting pending fires the builder's OnDelete Create trigger (#674).
+	require.Contains(t, ann, meta.AnnotationKeyExternalCreatePending, "pending was deleted, which fires the OnDelete Create trigger")
+	require.Contains(t, ann, meta.AnnotationKeyExternalCreateNotRequested, "the not-requested pass did not close pending")
+	require.False(t, meta.ExternalCreateIncomplete(pass.obj), "a not-requested pass must not read as an incomplete create")
 	require.NotContains(t, pass.events, string(reasonCreated), "CreatedExternalResource emitted for a create that was not requested")
 
 	ready := conditionOf(t, pass.obj, condition.TypeReady)
