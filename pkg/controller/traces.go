@@ -211,14 +211,17 @@ func (p *tracePass) event(name string, attrs ...attribute.KeyValue) {
 // NO step span: provider-runtime has a span per step, but a child span per pass would double the
 // span volume to say nothing the root does not. d.Remote is valid in Link mode too, so the mode
 // check is what keeps a value from being re-joined on every pass.
-func (p *tracePass) joinAct(ctx context.Context, name string) (context.Context, trace.Span) {
+func (p *tracePass) joinAct(ctx context.Context, name string, deferMark bool) (context.Context, trace.Span) {
 	if p.tracer == nil {
 		return ctx, trace.SpanFromContext(context.Background())
 	}
 	if p.d.Mode != tracecontext.Parent || p.actJoined {
-		// No step span for this act, but the pass DID act: mark the root (AttrActed), so a tail
-		// sampler keeps the record of the change. A joined act is marked by StartActStep itself.
-		tracecontext.MarkActed(ctx)
+		// No step span for this act. Unless the handler deferred it (DeferActedMark: it marks with
+		// MarkActed after a real write), mark the root (AttrActed) so a tail sampler keeps the record
+		// of the change. A joined act is marked by StartActStep itself.
+		if !deferMark {
+			tracecontext.MarkActed(ctx)
+		}
 		return ctx, trace.SpanFromContext(context.Background())
 	}
 	p.actJoined = true
@@ -316,7 +319,8 @@ func (c *Controller) beginAct(ctx context.Context, el *unstructured.Unstructured
 	if err := c.writeMarkerIf(ctx, el, p, tracecontext.BeforeFirstAction); err != nil {
 		return ctx, nil, err
 	}
-	actCtx, span := p.joinAct(ctx, name)
+	// Create, Update and Delete are external writes by definition, so their act always marks.
+	actCtx, span := p.joinAct(ctx, name, false)
 	return actCtx, span, nil
 }
 
@@ -346,7 +350,15 @@ func (p *tracePass) observing(el *unstructured.Unstructured) {
 // runtime requeues the pass quietly and the next one reads the object afresh.
 //
 // end records the act's error on the act step and ends it; call it once, after the act.
-func StartAct(ctx context.Context, mg *unstructured.Unstructured, name string) (actCtx context.Context, end func(error), err error) {
+//
+// By default the call also marks the pass's reconcile root acted (tracecontext.AttrActed), which a
+// tail sampler keeps. A handler whose act may turn out to change nothing passes DeferActedMark and
+// calls MarkActed once it knows it wrote something; see DeferActedMark.
+func StartAct(ctx context.Context, mg *unstructured.Unstructured, name string, opts ...ActOption) (actCtx context.Context, end func(error), err error) {
+	var o actOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
 	p := tracePassFrom(ctx)
 	if p.tracer == nil || p.c == nil || p.target == nil {
 		return ctx, func(error) {}, nil
@@ -375,9 +387,42 @@ func StartAct(ctx context.Context, mg *unstructured.Unstructured, name string) (
 		ann[tracecontext.AnnotationKeyTraceparentContinued] = v
 		p.target.SetAnnotations(ann)
 	}
-	actCtx, span := p.joinAct(ctx, name)
+	actCtx, span := p.joinAct(ctx, name, o.deferMark)
 	return actCtx, func(err error) {
 		telemetry.RecordSpanError(span, err)
 		span.End()
 	}, nil
+}
+
+// ActOption adjusts StartAct.
+type ActOption func(*actOptions)
+
+type actOptions struct{ deferMark bool }
+
+// DeferActedMark makes StartAct leave the reconcile root UNMARKED: the handler calls MarkActed when,
+// and only when, its act really wrote something.
+//
+// For a handler whose Observe runs its apply path on every pass (core-provider's composition
+// controller re-applies derived RBAC and runs a helm reconcile on each resync), the default marks
+// every pass acted, including the many that changed nothing, so a tail sampler keeping acted roots
+// keeps them all and the attribute stops meaning anything (Diego, 2026-11-14: "mark only on a real
+// write").
+//
+// One exception, deliberately: the FIRST act on a new krateo.io/traceparent value is still marked,
+// by plumbing's StartActStep, when it opens the act step joined to the upstream trace. That happens
+// once per requested change, not once per resync, and it is the act the upstream trace asked for.
+func DeferActedMark() ActOption {
+	return func(o *actOptions) { o.deferMark = true }
+}
+
+// MarkActed marks this pass's reconcile root acted (tracecontext.AttrActed=true), for a handler that
+// started its act with DeferActedMark and has now written something. Call it with the ctx StartAct
+// returned or the one Observe received; both carry the pass. Calling it more than once, or after a
+// joined act already marked the root, is harmless. With tracing off it does nothing.
+func MarkActed(ctx context.Context) {
+	p := tracePassFrom(ctx)
+	if p.tracer == nil || p.span == nil {
+		return
+	}
+	tracecontext.MarkActed(trace.ContextWithSpan(ctx, p.span))
 }

@@ -48,12 +48,15 @@ func upstreamSC(t *testing.T) trace.SpanContext {
 // false it applies nothing and returns ResourceExists false, so the runtime dispatches Create.
 type actingClient struct {
 	fakeExternalClient
-	exists   bool
-	bumpRV   string // when set, Observe "writes" the object first: the handler's copy is newer
-	observes atomic.Int32
-	applies  atomic.Int32
-	creates  atomic.Int32
-	actErrs  []error
+	exists bool
+	bumpRV string // when set, Observe "writes" the object first: the handler's copy is newer
+	// deferMark: Observe starts its act with DeferActedMark, and calls MarkActed only when wrote.
+	deferMark bool
+	wrote     bool
+	observes  atomic.Int32
+	applies   atomic.Int32
+	creates   atomic.Int32
+	actErrs   []error
 }
 
 func (c *actingClient) Observe(ctx context.Context, el *unstructured.Unstructured) (ExternalObservation, error) {
@@ -65,13 +68,19 @@ func (c *actingClient) Observe(ctx context.Context, el *unstructured.Unstructure
 	if c.bumpRV != "" {
 		mg.SetResourceVersion(c.bumpRV)
 	}
-	actCtx, end, err := StartAct(ctx, mg, "apply")
+	var opts []ActOption
+	if c.deferMark {
+		opts = append(opts, DeferActedMark())
+	}
+	actCtx, end, err := StartAct(ctx, mg, "apply", opts...)
 	c.actErrs = append(c.actErrs, err)
 	if err != nil {
 		return ExternalObservation{}, err
 	}
 	c.applies.Add(1)
-	_ = actCtx // a real handler passes it to the call that applies
+	if c.deferMark && c.wrote {
+		MarkActed(actCtx) // the apply changed something
+	}
 	end(nil)
 	return ExternalObservation{ResourceExists: true, ResourceUpToDate: true}, nil
 }
@@ -527,4 +536,45 @@ func TestTraceMemoDecide(t *testing.T) {
 	// The annotation going away drops the entry.
 	m.decide(true, key, obj("u2", nil), now, tracecontext.DefaultContinueWindow)
 	require.Zero(t, m.len())
+}
+
+// Diego, 2026-11-14: "mark only on a real write". A handler whose Observe applies on every pass
+// (core-provider's composition controller) starts its act with DeferActedMark and marks the root
+// with MarkActed only when the apply changed something. So an apply pass that wrote nothing leaves
+// the root unmarked, one that wrote marks it, and the default StartAct (the control) still marks
+// every act. No upstream traceparent here, so no act joins: these are the per-resync acts.
+func TestTraceDeferredActMarksOnlyARealWrite(t *testing.T) {
+	h := newTraceHarness(t, true, nil)
+	h.ext.exists = true
+	lastRoot := func() sdktrace.ReadOnlySpan {
+		var roots []sdktrace.ReadOnlySpan
+		for _, s := range h.rec.Ended() {
+			if s.Name() == tracecontext.SpanReconcile {
+				roots = append(roots, s)
+			}
+		}
+		require.NotEmpty(t, roots)
+		return roots[len(roots)-1]
+	}
+
+	h.ext.deferMark, h.ext.wrote = true, false
+	require.NoError(t, h.pass(ctrlevent.Observe))
+	_, ok := rootActed(lastRoot())
+	require.False(t, ok, "an apply that wrote nothing must leave the root unmarked")
+	require.Equal(t, int32(1), h.ext.applies.Load(), "control: the apply path ran")
+
+	h.ext.wrote = true
+	require.NoError(t, h.pass(ctrlevent.Observe))
+	v, ok := rootActed(lastRoot())
+	require.True(t, ok && v, "an apply that wrote must mark the root acted")
+
+	h.ext.deferMark, h.ext.wrote = false, false
+	require.NoError(t, h.pass(ctrlevent.Observe))
+	v, ok = rootActed(lastRoot())
+	require.True(t, ok && v, "control: the default StartAct still marks every act")
+}
+
+// MarkActed with tracing off, or outside a pass, does nothing and does not panic.
+func TestMarkActedOutsideAPassIsANoop(t *testing.T) {
+	MarkActed(context.Background())
 }
