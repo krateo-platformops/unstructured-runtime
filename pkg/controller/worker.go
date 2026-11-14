@@ -1249,7 +1249,16 @@ func (c *Controller) handleCreate(ctx context.Context, ref objectref.ObjectRef) 
 	if merr != nil {
 		return merr
 	}
-	created, actionErr := c.create(actCtx, el)
+	// A ResultCreator says whether it requested anything; a plain client's nil Create means it did.
+	// The call stays HERE, in the handler entry point: only the entry points sit behind
+	// processItem's rate-limit gate (TestRateLimitGateIsTheOnlyWayToTheExternalClient).
+	var created CreateResult
+	var actionErr error
+	if rc, ok := c.externalClient.(ResultCreator); ok {
+		created, actionErr = rc.CreateWithResult(actCtx, el)
+	} else {
+		created, actionErr = CreateResult{Requested: true}, c.externalClient.Create(actCtx, el)
+	}
 	telemetry.RecordSpanError(act, actionErr)
 	act.End()
 	if c.metrics != nil {
@@ -1376,15 +1385,6 @@ func (c *Controller) handleCreate(ctx context.Context, ref objectref.ObjectRef) 
 	}
 	c.recordEvent(el, event.Normal(reasonCreated, actionCreateEvent, "Successfully requested creation of external resource"))
 	return nil
-}
-
-// create calls the client's create: CreateWithResult when it is a ResultCreator, otherwise Create,
-// whose nil return means a create was requested.
-func (c *Controller) create(ctx context.Context, el *unstructured.Unstructured) (CreateResult, error) {
-	if rc, ok := c.externalClient.(ResultCreator); ok {
-		return rc.CreateWithResult(ctx, el)
-	}
-	return CreateResult{Requested: true}, c.externalClient.Create(ctx, el)
 }
 
 // createNotRequested ends a create pass whose client reported that it requested nothing
