@@ -12,6 +12,7 @@ import (
 	metricsserver "github.com/krateo-platformops/unstructured-runtime/pkg/metrics/server"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
 
@@ -87,6 +88,18 @@ func Build(ctx context.Context, conf Configuration, optsFuncs ...FuncOption) (*c
 		return nil, fmt.Errorf("failed to create dynamic client: %w", err)
 	}
 
+	var ownership *controller.Ownership
+	if opts.ownership != nil {
+		cs, err := kubernetes.NewForConfig(conf.Config)
+		if err != nil {
+			opts.logger.Error(err, "failed to create the client for the ownership lease")
+			return nil, fmt.Errorf("failed to create the client for the ownership lease: %w", err)
+		}
+		o := *opts.ownership
+		o.Leases = cs.CoordinationV1()
+		ownership = &o
+	}
+
 	ctrl, err := controller.New(sid, controller.Options{
 		Pluralizer:              opts.pluralizer,
 		Client:                  client,
@@ -106,6 +119,7 @@ func Build(ctx context.Context, conf Configuration, optsFuncs ...FuncOption) (*c
 		ActionsEvent:            opts.actionsEvent,
 		GracefulShutdownTimeout: opts.gracefulShutdownTimeout,
 		TracerProvider:          opts.tracerProvider,
+		Ownership:               ownership,
 	})
 	if err != nil {
 		opts.logger.Error(err, "failed to create controller")

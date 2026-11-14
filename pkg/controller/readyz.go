@@ -23,6 +23,10 @@ import (
 // It is safe to call at any time, from any goroutine, including before Run: the informer is not
 // running yet then, so the check reports not-ready, which is the truth.
 //
+// With Ownership set, it also fails while the ownership Lease cannot be read or written, because
+// such a controller can never reconcile. A controller merely WAITING for a Lease another process
+// holds is Ready; Ownership explains why.
+//
 // What it does NOT answer:
 //
 //   - Liveness. A failing list or watch is a recoverable state (a CRD version briefly unserved
@@ -33,8 +37,10 @@ import (
 //     leaves this check passing while the reflector logs "Failed to watch". A restart then lists
 //     afresh and does report it.
 func (c *Controller) ReadyzCheck(_ *http.Request) error {
-	if c.informer.HasSynced() {
-		return nil
+	if !c.informer.HasSynced() {
+		return fmt.Errorf("informer for %s has not completed its first successful list", c.gvr.String())
 	}
-	return fmt.Errorf("informer for %s has not completed its first successful list", c.gvr.String())
+	// With Ownership: a controller WAITING for the Lease is Ready (see Ownership for why), but one
+	// that cannot read or write the Lease can never reconcile, and is not.
+	return c.ownershipReadyzError()
 }

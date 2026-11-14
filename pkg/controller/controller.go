@@ -200,6 +200,11 @@ type Options struct {
 	// provider, even a no-op one, means tracing is ON: the controller then writes the
 	// krateo.io/traceparent-continued marker. Mirrors provider-runtime's WithTracerProvider.
 	TracerProvider trace.TracerProvider
+
+	// Ownership makes Run reconcile only while it holds a coordination.k8s.io Lease, so a second
+	// process for the same resource waits instead of reconciling alongside. Nil: no Lease. See
+	// Ownership.
+	Ownership *Ownership
 }
 
 func (o Options) validate() error {
@@ -227,7 +232,7 @@ func (o Options) validate() error {
 	if o.MaxRetries < 0 {
 		return fmt.Errorf("max retries must be greater than or equal to 0")
 	}
-	return nil
+	return o.Ownership.validate()
 }
 
 type Controller struct {
@@ -255,10 +260,14 @@ type Controller struct {
 	runCtx context.Context
 
 	// gracefulShutdownTimeout is the resolved drain window used by Run on shutdown.
-	// Guarded by gracefulShutdownMu so a future leader-election runnable can zero it via
-	// SetGracefulShutdownTimeout (release-on-lease-loss) without racing Run's read.
+	// Guarded by gracefulShutdownMu so SetGracefulShutdownTimeout does not race Run's read.
 	gracefulShutdownMu      sync.RWMutex
 	gracefulShutdownTimeout time.Duration
+
+	// ownership is Options.Ownership; nil runs without a Lease. ownershipState records what the
+	// Lease attempts have shown, for ReadyzCheck and the holder log.
+	ownership      *Ownership
+	ownershipState ownershipState
 }
 
 var (
@@ -649,6 +658,7 @@ func New(sid *shortid.Shortid, opts Options) (*Controller, error) {
 		tracerProv:              opts.TracerProvider,
 		objects:                 newObjectGate(),
 		gracefulShutdownTimeout: gracefulShutdownTimeout,
+		ownership:               opts.Ownership,
 	}, nil
 }
 
@@ -716,6 +726,23 @@ func (c *Controller) Run(ctx context.Context, numWorkers int) error {
 		return err
 	}
 
+	// With Ownership, no worker starts until this process holds the Lease. The informer above keeps
+	// queuing meanwhile, which is why it was started first.
+	var ownershipLost <-chan struct{}
+	if c.ownership != nil {
+		lead, release, err := c.acquireOwnership(ctx)
+		if err != nil {
+			return err
+		}
+		if lead == nil {
+			return nil // stopped before owning: no worker ran, so there is nothing to drain
+		}
+		// Deferred, so it runs after the drain below returns: the next owner starts only once this
+		// one has stopped writing.
+		defer release()
+		ownershipLost = lead.Done()
+	}
+
 	// reconcileCtx is derived from context.Background(), NOT from the caller's ctx, so an
 	// in-flight reconcile keeps a live context (its API writes complete) even after SIGTERM
 	// cancels ctx. It is cancelled only once the drain finishes or the grace period expires.
@@ -745,7 +772,18 @@ func (c *Controller) Run(ctx context.Context, numWorkers int) error {
 	}
 	c.logger.Info("Controller ready.")
 
-	<-ctx.Done() // SIGTERM (or caller cancel): begin the bounded drain.
+	select {
+	case <-ctx.Done(): // SIGTERM (or caller cancel): begin the bounded drain.
+	case <-ownershipLost:
+		// The Lease could not be renewed, so another process may already own the resource. Stop
+		// writing now rather than after a drain: cancel in-flight reconciles at once, and do not
+		// wait for them, exactly as a zero grace period does.
+		c.logger.Info("Lost the ownership lease; cancelling in-flight reconciles at once", "lease", c.ownership.describe())
+		close(stopWorkers)
+		c.queue.ShutDown()
+		reconcileCancel()
+		return ErrOwnershipLost
+	}
 	timeout := c.getGracefulShutdownTimeout()
 	c.logger.Info("Stopping controller; draining in-flight reconciles", "gracePeriod", timeout.String())
 
@@ -785,10 +823,8 @@ func (c *Controller) Run(ctx context.Context, numWorkers int) error {
 	return nil
 }
 
-// SetGracefulShutdownTimeout overrides the drain window at runtime. It exists as the seam for
-// a future leader-election runnable to force an immediate release on lease loss
-// (SetGracefulShutdownTimeout(0) in OnStoppedLeading, mirroring controller-runtime), avoiding a
-// split-brain double-writer during HA rollouts.
+// SetGracefulShutdownTimeout overrides the drain window at runtime. Losing the ownership Lease does
+// not go through it: Run cancels in-flight reconciles directly on that path (see Ownership).
 func (c *Controller) SetGracefulShutdownTimeout(d time.Duration) {
 	c.gracefulShutdownMu.Lock()
 	defer c.gracefulShutdownMu.Unlock()
