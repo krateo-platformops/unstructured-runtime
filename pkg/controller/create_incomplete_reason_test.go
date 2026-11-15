@@ -27,6 +27,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"github.com/krateo-platformops/unstructured-runtime/pkg/tools/unstructured/condition"
 	"strings"
 	"testing"
 	"time"
@@ -117,4 +118,13 @@ func TestCreateIncomplete_ConditionCarriesTheReason(t *testing.T) {
 	require.Contains(t, joined, "remove the",
 		"the remediation advice was lost: the message must carry BOTH what to do and why, "+
 			"conditions were: "+joined)
+
+	// #93: READY itself names the refusal, with the cause and the remediation. It used to be a bare
+	// Creating, indistinguishable from a healthy create in progress, with the cause reachable only
+	// on Synced.
+	ready := unstructuredtools.GetCondition(got, condition.TypeReady, condition.ReasonCreateOutcomeUnknown)
+	require.NotNil(t, ready, "Ready must be False/CreateOutcomeUnknown; conditions were: "+joined)
+	require.Equal(t, metav1.ConditionFalse, ready.Status)
+	require.Contains(t, ready.Message, reason, "Ready's message must carry the existence check's error")
+	require.Contains(t, ready.Message, "remove the", "Ready's message must carry the remediation")
 }

@@ -54,6 +54,15 @@ const (
 	// PAUSED, so the value is the last one observed and is not being refreshed. Status stays True —
 	// a paused resource is still available, it just is not converging (core-provider#241).
 	ReasonReconcilePausedReady string = "ReconcilePaused"
+	// ReasonCreateOutcomeUnknown: a create was started and its outcome cannot be determined (the
+	// krateo.io/external-create-pending marker is set and the existence check failed), so the
+	// runtime refuses to act rather than risk creating the resource twice (unstructured-runtime#93).
+	// It was a bare Creating, which reads like a healthy create in progress. The message carries the
+	// existence check's error and the remediation. It clears when a later existence check succeeds
+	// (retried on every resync; a transient cause clears by itself) or when a human, having verified
+	// the external state, removes the marker; a permanent cause (a kind with no read verb, say)
+	// needs the human.
+	ReasonCreateOutcomeUnknown string = "CreateOutcomeUnknown"
 )
 
 // Reasons a resource is or is not synced.
@@ -184,6 +193,18 @@ func ObserveFailed(message string) metav1.Condition {
 		Status:             metav1.ConditionUnknown,
 		LastTransitionTime: metav1.Now(),
 		Reason:             ReasonObserveFailed,
+		Message:            message,
+	}
+}
+
+// CreateOutcomeUnknown is Ready=False/CreateOutcomeUnknown with message: see
+// ReasonCreateOutcomeUnknown.
+func CreateOutcomeUnknown(message string) metav1.Condition {
+	return metav1.Condition{
+		Type:               TypeReady,
+		Status:             metav1.ConditionFalse,
+		LastTransitionTime: metav1.Now(),
+		Reason:             ReasonCreateOutcomeUnknown,
 		Message:            message,
 	}
 }
