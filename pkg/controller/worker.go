@@ -637,7 +637,10 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 			c.recordEvent(el, event.Warning(reasonCannotInitialize, actionProcessEvent, wrapped))
 
 			err = unstructuredtools.SetConditions(el,
-				condition.Creating(),
+				// #93: its own reason, carrying the cause and the remediation. A bare Creating read
+				// like a healthy create in progress, while this refusal lasts until the existence
+				// check succeeds or a human clears the marker.
+				condition.CreateOutcomeUnknown(wrapped.Error()),
 				condition.ReconcileError(wrapped),
 			)
 			if err != nil {
