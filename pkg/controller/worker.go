@@ -473,6 +473,9 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 	decision := c.traces.decide(tracer != nil, traceKey, el, time.Now(), tracecontext.DefaultContinueWindow)
 	traceObj := tracecontext.Object{Kind: el.GetKind(), Name: el.GetName(), Namespace: el.GetNamespace()}
 	ctx, span := tracecontext.StartReconcile(ctx, tracer, traceObj, decision, time.Now())
+	if len(c.spanAttrs) > 0 {
+		span.SetAttributes(c.spanAttrs...) // which controller (Options.SpanAttributes)
+	}
 	pass := offPass
 	if tracer != nil {
 		pass = &tracePass{tracer: tracer, span: span, d: decision, obj: traceObj, key: traceKey, uid: el.GetUID(), memo: &c.traces, c: c, target: el}

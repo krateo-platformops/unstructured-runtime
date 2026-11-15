@@ -12,6 +12,7 @@ import (
 	metricsserver "github.com/krateo-platformops/unstructured-runtime/pkg/metrics/server"
 	"github.com/krateo-platformops/unstructured-runtime/pkg/pluralizer"
 	"github.com/krateo-platformops/unstructured-runtime/pkg/telemetry"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/time/rate"
 	"k8s.io/client-go/util/workqueue"
@@ -53,6 +54,9 @@ type options struct {
 
 	// tracerProvider is controller.Options.TracerProvider; nil => the process default.
 	tracerProvider trace.TracerProvider
+
+	// spanAttributes is controller.Options.SpanAttributes.
+	spanAttributes []attribute.KeyValue
 
 	// ownership is the Lease the controller must hold to reconcile; nil => none. Build fills in
 	// its Leases client from the Configuration's rest.Config.
@@ -103,6 +107,15 @@ func WithNamespace(ns string) func(o *options) {
 func WithGracefulShutdownTimeout(d time.Duration) func(o *options) {
 	return func(o *options) {
 		o.gracefulShutdownTimeout = &d
+	}
+}
+
+// WithSpanAttributes sets attributes on every reconcile root span the controller starts, naming the
+// controller (e.g. krateo.composition.gvr) so its traces stay attributable in a process that hosts
+// several. See controller.Options.SpanAttributes.
+func WithSpanAttributes(attrs ...attribute.KeyValue) func(o *options) {
+	return func(o *options) {
+		o.spanAttributes = append(o.spanAttributes, attrs...)
 	}
 }
 

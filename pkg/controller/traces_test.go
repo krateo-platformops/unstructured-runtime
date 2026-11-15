@@ -15,6 +15,7 @@ import (
 	"github.com/krateo-platformops/unstructured-runtime/pkg/meta"
 	"github.com/krateo-platformops/unstructured-runtime/pkg/telemetry"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
@@ -577,4 +578,51 @@ func TestTraceDeferredActMarksOnlyARealWrite(t *testing.T) {
 // MarkActed with tracing off, or outside a pass, does nothing and does not panic.
 func TestMarkActedOutsideAPassIsANoop(t *testing.T) {
 	MarkActed(context.Background())
+}
+
+// Options.SpanAttributes name the controller on every reconcile root, so a process hosting several
+// controllers (core-provider's cdc pool, step 3) keeps each one's traces attributable. The control
+// is the same pass without the option: no such attribute.
+func TestTraceRootCarriesSpanAttributes(t *testing.T) {
+	gvr := attribute.String("krateo.composition.gvr", "test.example.org/v1/tests")
+	for _, tc := range []struct {
+		name  string
+		attrs []attribute.KeyValue
+		want  bool
+	}{{"with SpanAttributes", []attribute.KeyValue{gvr}, true}, {"without (control)", nil, false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := tracetest.NewSpanRecorder()
+			sdk := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
+			t.Cleanup(func() { _ = sdk.Shutdown(context.Background()) })
+			sid, err := shortid.New(1, shortid.DefaultABC, 2342)
+			require.NoError(t, err)
+			opts := createTestOptions()
+			opts.TracerProvider = sdk
+			opts.SpanAttributes = tc.attrs
+			ctrl, err := New(sid, opts)
+			require.NoError(t, err)
+			ctrl.externalClient = &actingClient{exists: true}
+			obj := createTestUnstructured("attrs", opts.Namespace)
+			_, err = opts.Client.Resource(opts.GVR).Namespace(opts.Namespace).Create(context.TODO(), obj, metav1.CreateOptions{})
+			require.NoError(t, err)
+			require.NoError(t, ctrl.processItem(context.TODO(), ctrlevent.Event{
+				EventType: ctrlevent.Observe,
+				ObjectRef: objectref.ObjectRef{APIVersion: "test.example.org/v1", Kind: "Test", Name: "attrs", Namespace: opts.Namespace},
+			}))
+			var root sdktrace.ReadOnlySpan
+			for _, s := range rec.Ended() {
+				if s.Name() == tracecontext.SpanReconcile {
+					root = s
+				}
+			}
+			require.NotNil(t, root, "control: the pass started a reconcile root")
+			got := false
+			for _, kv := range root.Attributes() {
+				if kv.Key == gvr.Key && kv.Value.AsString() == gvr.Value.AsString() {
+					got = true
+				}
+			}
+			require.Equal(t, tc.want, got, "root carries %s", gvr.Key)
+		})
+	}
 }
