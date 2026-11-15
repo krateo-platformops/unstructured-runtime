@@ -23,6 +23,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 
 	"slices"
 
@@ -354,6 +355,12 @@ func (c *Controller) handleErr(err error, obj ctrlevent.Event, priority int) {
 	if err == nil {
 		return
 	}
+	// core-provider#533: an object that left this controller's selector mid-pass belongs to another
+	// controller now. Requeueing would only fetch it again and drop it then; forget it here.
+	if errors.Is(err, errLeftSelector) {
+		c.queue.Forget(obj)
+		return
+	}
 
 	// A DEFERRAL IS HANDLED FIRST, AHEAD OF THE maxRetries CHECK, and differently from a failure in
 	// every respect that matters:
@@ -453,6 +460,10 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 	ctx = contextutils.BuildContext(ctx, contextutils.WithLogger(lg))
 	traceKey := types.NamespacedName{Namespace: evt.ObjectRef.Namespace, Name: evt.ObjectRef.Name}
 	el, err := c.fetch(ctx, evt.ObjectRef, false)
+	if errors.Is(err, errLeftSelector) {
+		lg.Info("Not acting on an object that left this controller's label selector after its event was queued", "reason", err.Error())
+		return nil
+	}
 	if err != nil {
 		lg.Debug("Cannot fetch managed resource", "err", err) // This is returned as debug as debug info. This can occur normally if the resource was deleted.
 		if apierrors.IsNotFound(err) {
@@ -1663,6 +1674,15 @@ func (c *Controller) handleDelete(ctx context.Context, ref objectref.ObjectRef) 
 	return nil
 }
 
+// errLeftSelector is fetch's answer for an object that exists but no longer matches this
+// controller's label selector (core-provider#533). The informer stops delivering such an object,
+// but an event queued before it left, or a re-read in the middle of a pass, still reaches it through
+// the live Get. Acting on it is acting on an object another controller now owns: on a composition
+// version bump, the retiring controller rendered its OLD chart with the composition's NEW values,
+// which a write at the new apiVersion had already re-labelled away from it. Not a failure: the
+// event is dropped, never requeued (handleErr).
+var errLeftSelector = errors.New("the object no longer matches this controller's label selector")
+
 func (c *Controller) fetch(ctx context.Context, ref objectref.ObjectRef, clean bool) (res *unstructured.Unstructured, err error) {
 	if c.dynamicClient == nil {
 		return nil, fmt.Errorf("dynamic client is not configured")
@@ -1680,6 +1700,9 @@ func (c *Controller) fetch(ctx context.Context, ref objectref.ObjectRef, clean b
 	res, err = c.dynamicClient.Resource(c.gvr).
 		Namespace(ref.Namespace).
 		Get(ctx, ref.Name, metav1.GetOptions{})
+	if err == nil && c.selector != nil && !c.selector.Matches(labels.Set(res.GetLabels())) {
+		return nil, fmt.Errorf("%w (%s): labels %v", errLeftSelector, c.selector.String(), res.GetLabels())
+	}
 	if err == nil {
 		if clean && res != nil {
 			unstructured.RemoveNestedField(res.Object,

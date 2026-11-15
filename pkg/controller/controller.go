@@ -25,6 +25,7 @@ import (
 	"github.com/krateo-platformops/unstructured-runtime/pkg/telemetry"
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -275,7 +276,12 @@ type Controller struct {
 
 	// ownership is Options.Ownership; nil runs without a Lease. ownershipState records what the
 	// Lease attempts have shown, for ReadyzCheck and the holder log.
-	ownership      *Ownership
+	ownership *Ownership
+	// selector is the ListWatcher's label selector, parsed once (core-provider#533). The informer
+	// delivers only objects that match it; fetch applies the same test to every LIVE re-read, so an
+	// object that left this controller's selector after its event was queued is not acted on.
+	// Nil when no label selector is configured.
+	selector       labels.Selector
 	ownershipState ownershipState
 }
 
@@ -314,6 +320,14 @@ func New(sid *shortid.Shortid, opts Options) (*Controller, error) {
 	if err := opts.validate(); err != nil {
 		opts.Logger.Error(err, "Invalid controller options")
 		return nil, fmt.Errorf("invalid controller options: %w", err)
+	}
+	var selector labels.Selector
+	if ls := opts.ListWatcher.LabelSelector; ls != nil && *ls != "" {
+		s, err := labels.Parse(*ls)
+		if err != nil {
+			return nil, fmt.Errorf("parsing the ListWatcher label selector %q: %w", *ls, err)
+		}
+		selector = s
 	}
 	queue := priorityqueue.New("controller", func(o *priorityqueue.Opts[any]) {
 		o.RateLimiter = opts.GlobalRateLimiter
@@ -669,6 +683,7 @@ func New(sid *shortid.Shortid, opts Options) (*Controller, error) {
 		objects:                 newObjectGate(),
 		gracefulShutdownTimeout: gracefulShutdownTimeout,
 		ownership:               opts.Ownership,
+		selector:                selector,
 	}, nil
 }
 
