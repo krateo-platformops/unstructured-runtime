@@ -2,6 +2,7 @@ package telemetry
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -34,9 +35,32 @@ type Config struct {
 
 // Metrics exposes a small set of low-cardinality runtime metrics for
 // unstructured-runtime consumers.
+//
+// A Metrics is a VIEW: the shared instruments (meters) plus the attributes it adds to every point
+// it records. Setup returns the root view, which adds none, so a process hosting one controller
+// exports exactly what it always has. A process hosting several controllers (core-provider's cdc
+// pool, docs/design/cdc-pooling.md step 3) gives each one its own view with With, so each
+// controller's numbers stay attributable instead of merging into one process-wide stream.
 type Metrics struct {
+	*meters
+
+	// attrs are added to every point this view records; empty for the root view.
+	attrs attribute.Set
+	// inFlight is this view's own reconciles in flight, reported per view by the gauge callback.
+	inFlight atomic.Int64
+	// registered: this view's in-flight count is reported (the root always is; a With view once
+	// it first counts a reconcile, so an idle view adds no series).
+	registered atomic.Bool
+}
+
+// meters holds what every view of one Metrics shares: the instruments, the process identity, the
+// process-level saturation source, and the views whose in-flight counts the gauge reports.
+type meters struct {
 	log            logging.Logger
 	deploymentName string // For tracking instance identity in exported metrics
+
+	viewsMu sync.Mutex
+	views   []*Metrics
 
 	startupSuccess metric.Int64Counter
 	startupFailure metric.Int64Counter
@@ -47,13 +71,12 @@ type Metrics struct {
 	connectDuration metric.Float64Histogram
 	connectFailure  metric.Int64Counter
 
-	reconcileDuration      metric.Float64Histogram
-	queueDepth             metric.Int64UpDownCounter
-	queueWaitDuration      metric.Float64Histogram
-	queueOldestItemAge     metric.Float64Histogram
-	queueWorkDuration      metric.Float64Histogram
-	reconcileInFlight      metric.Int64ObservableGauge
-	reconcileInFlightCount atomic.Int64
+	reconcileDuration  metric.Float64Histogram
+	queueDepth         metric.Int64UpDownCounter
+	queueWaitDuration  metric.Float64Histogram
+	queueOldestItemAge metric.Float64Histogram
+	queueWorkDuration  metric.Float64Histogram
+	reconcileInFlight  metric.Int64ObservableGauge
 
 	localCapacity          metric.Int64ObservableGauge
 	saturationInput        metric.Float64ObservableGauge
@@ -179,10 +202,12 @@ func NewWithMeter(meter metric.Meter, log logging.Logger, deploymentName string)
 
 func newMetrics(meter metric.Meter, log logging.Logger, deploymentName string) (*Metrics, error) {
 	var err error
-	m := &Metrics{
+	m := &Metrics{meters: &meters{
 		log:            log,
 		deploymentName: deploymentName,
-	}
+	}}
+	m.registered.Store(true)
+	m.views = []*Metrics{m}
 
 	if m.startupSuccess, err = meter.Int64Counter("unstructured_runtime.startup.success"); err != nil {
 		return nil, err
@@ -300,7 +325,12 @@ func newMetrics(meter metric.Meter, log logging.Logger, deploymentName string) (
 	}
 
 	_, err = meter.RegisterCallback(func(_ context.Context, observer metric.Observer) error {
-		observer.ObserveInt64(m.reconcileInFlight, m.reconcileInFlightCount.Load())
+		m.viewsMu.Lock()
+		views := append([]*Metrics(nil), m.views...)
+		m.viewsMu.Unlock()
+		for _, v := range views {
+			observer.ObserveInt64(m.reconcileInFlight, v.inFlight.Load(), metric.WithAttributeSet(v.attrs))
+		}
 		m.observeSaturation(observer)
 		return nil
 	}, m.reconcileInFlight, m.localCapacity, m.saturationInput, m.saturationInputEnabled)
@@ -361,7 +391,7 @@ func (m *Metrics) IncRateLimitDeferral(ctx context.Context, key string, reason r
 		return
 	}
 	attrs := append(m.instanceAttrs(), attribute.String("key", key), attribute.String("cause", reason.Cause()))
-	m.rateLimitDeferrals.Add(ctx, 1, metric.WithAttributes(attrs...))
+	m.rateLimitDeferrals.Add(ctx, 1, m.point(attrs...))
 }
 
 // instanceAttrs returns metric attributes for instance identification.
@@ -375,75 +405,98 @@ func (m *Metrics) instanceAttrs() []attribute.KeyValue {
 	}
 }
 
+// With returns a view of m that adds attrs to every point it records, on top of m's own. The view
+// shares m's instruments, so it costs no new metric streams beyond the new attribute values. Use one
+// per controller in a process that hosts several (core-provider's cdc pool), with attributes naming
+// the controller. A nil m returns nil, like every other method.
+//
+// Saturation (local capacity and its input) is not per view: it measures the PROCESS, which every
+// controller in it shares, so it keeps only the process identity.
+func (m *Metrics) With(attrs ...attribute.KeyValue) *Metrics {
+	if m == nil {
+		return nil
+	}
+	merged := append(m.attrs.ToSlice(), attrs...)
+	return &Metrics{meters: m.meters, attrs: attribute.NewSet(merged...)}
+}
+
+// point is the measurement option carrying this view's attributes plus extra.
+func (m *Metrics) point(extra ...attribute.KeyValue) metric.MeasurementOption {
+	if len(extra) == 0 {
+		return metric.WithAttributeSet(m.attrs)
+	}
+	return metric.WithAttributes(append(m.attrs.ToSlice(), extra...)...)
+}
+
 func (m *Metrics) IncStartupSuccess(ctx context.Context) {
 	if m == nil {
 		return
 	}
-	m.startupSuccess.Add(ctx, 1)
+	m.startupSuccess.Add(ctx, 1, m.point())
 }
 
 func (m *Metrics) IncStartupFailure(ctx context.Context) {
 	if m == nil {
 		return
 	}
-	m.startupFailure.Add(ctx, 1)
+	m.startupFailure.Add(ctx, 1, m.point())
 }
 
 func (m *Metrics) RecordGetDuration(ctx context.Context, d time.Duration) {
 	if m == nil {
 		return
 	}
-	m.getDuration.Record(ctx, d.Seconds())
+	m.getDuration.Record(ctx, d.Seconds(), m.point())
 }
 
 func (m *Metrics) IncGetFailure(ctx context.Context) {
 	if m == nil {
 		return
 	}
-	m.getFailure.Add(ctx, 1)
+	m.getFailure.Add(ctx, 1, m.point())
 }
 
 func (m *Metrics) RecordReconcileDuration(ctx context.Context, d time.Duration) {
 	if m == nil {
 		return
 	}
-	m.reconcileDuration.Record(ctx, d.Seconds())
+	m.reconcileDuration.Record(ctx, d.Seconds(), m.point())
 }
 
 func (m *Metrics) RecordQueueWaitDuration(ctx context.Context, d time.Duration) {
 	if m == nil {
 		return
 	}
-	m.queueWaitDuration.Record(ctx, d.Seconds())
+	m.queueWaitDuration.Record(ctx, d.Seconds(), m.point())
 }
 
 func (m *Metrics) RecordQueueWorkDuration(ctx context.Context, d time.Duration) {
 	if m == nil {
 		return
 	}
-	m.queueWorkDuration.Record(ctx, d.Seconds())
+	m.queueWorkDuration.Record(ctx, d.Seconds(), m.point())
 }
 
 func (m *Metrics) recordRequeue(ctx context.Context, reason string, counter metric.Int64Counter) {
 	if m == nil {
 		return
 	}
-	counter.Add(ctx, 1)
-	m.queueRequeueTotal.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", reason)))
+	counter.Add(ctx, 1, m.point())
+	m.queueRequeueTotal.Add(ctx, 1, m.point(attribute.String("reason", reason)))
 }
 
 func (m *Metrics) IncReconcileSuccess(ctx context.Context) {
 	if m == nil {
 		return
 	}
-	m.reconcileSuccess.Add(ctx, 1)
+	m.reconcileSuccess.Add(ctx, 1, m.point())
 }
 
 func (m *Metrics) IncReconcileFailure(ctx context.Context) {
 	if m == nil {
 		return
 	}
-	m.reconcileFailure.Add(ctx, 1)
+	m.reconcileFailure.Add(ctx, 1, m.point())
 }
 
 func (m *Metrics) IncReconcileRequeueAfter(ctx context.Context) {
@@ -462,131 +515,136 @@ func (m *Metrics) AddReconcileInFlight(delta int64) {
 	if m == nil || delta == 0 {
 		return
 	}
-	m.reconcileInFlightCount.Add(delta)
+	if !m.registered.Load() && m.registered.CompareAndSwap(false, true) {
+		m.viewsMu.Lock()
+		m.views = append(m.views, m)
+		m.viewsMu.Unlock()
+	}
+	m.inFlight.Add(delta)
 }
 
 func (m *Metrics) RecordObserveDuration(ctx context.Context, d time.Duration) {
 	if m == nil {
 		return
 	}
-	m.observeDuration.Record(ctx, d.Seconds())
+	m.observeDuration.Record(ctx, d.Seconds(), m.point())
 }
 
 func (m *Metrics) IncObserveFailure(ctx context.Context) {
 	if m == nil {
 		return
 	}
-	m.observeFailure.Add(ctx, 1)
+	m.observeFailure.Add(ctx, 1, m.point())
 }
 
 func (m *Metrics) RecordCreateDuration(ctx context.Context, d time.Duration) {
 	if m == nil {
 		return
 	}
-	m.createDuration.Record(ctx, d.Seconds())
+	m.createDuration.Record(ctx, d.Seconds(), m.point())
 }
 
 func (m *Metrics) IncCreateFailure(ctx context.Context) {
 	if m == nil {
 		return
 	}
-	m.createFailure.Add(ctx, 1)
+	m.createFailure.Add(ctx, 1, m.point())
 }
 
 func (m *Metrics) RecordUpdateDuration(ctx context.Context, d time.Duration) {
 	if m == nil {
 		return
 	}
-	m.updateDuration.Record(ctx, d.Seconds())
+	m.updateDuration.Record(ctx, d.Seconds(), m.point())
 }
 
 func (m *Metrics) IncUpdateFailure(ctx context.Context) {
 	if m == nil {
 		return
 	}
-	m.updateFailure.Add(ctx, 1)
+	m.updateFailure.Add(ctx, 1, m.point())
 }
 
 func (m *Metrics) RecordDeleteDuration(ctx context.Context, d time.Duration) {
 	if m == nil {
 		return
 	}
-	m.deleteDuration.Record(ctx, d.Seconds())
+	m.deleteDuration.Record(ctx, d.Seconds(), m.point())
 }
 
 func (m *Metrics) IncDeleteFailure(ctx context.Context) {
 	if m == nil {
 		return
 	}
-	m.deleteFailure.Add(ctx, 1)
+	m.deleteFailure.Add(ctx, 1, m.point())
 }
 
 func (m *Metrics) RecordFinalizerAddDuration(ctx context.Context, d time.Duration) {
 	if m == nil {
 		return
 	}
-	m.finalizerAddDuration.Record(ctx, d.Seconds())
+	m.finalizerAddDuration.Record(ctx, d.Seconds(), m.point())
 }
 
 func (m *Metrics) IncFinalizerAddFailure(ctx context.Context) {
 	if m == nil {
 		return
 	}
-	m.finalizerAddFailure.Add(ctx, 1)
+	m.finalizerAddFailure.Add(ctx, 1, m.point())
 }
 
 func (m *Metrics) RecordFinalizerRemoveDuration(ctx context.Context, d time.Duration) {
 	if m == nil {
 		return
 	}
-	m.finalizerRemoveDuration.Record(ctx, d.Seconds())
+	m.finalizerRemoveDuration.Record(ctx, d.Seconds(), m.point())
 }
 
 func (m *Metrics) IncFinalizerRemoveFailure(ctx context.Context) {
 	if m == nil {
 		return
 	}
-	m.finalizerRemoveFailure.Add(ctx, 1)
+	m.finalizerRemoveFailure.Add(ctx, 1, m.point())
 }
 
 func (m *Metrics) RecordStatusUpdateDuration(ctx context.Context, d time.Duration) {
 	if m == nil {
 		return
 	}
-	m.statusUpdateDuration.Record(ctx, d.Seconds())
+	m.statusUpdateDuration.Record(ctx, d.Seconds(), m.point())
 }
 
 func (m *Metrics) IncStatusUpdateFailure(ctx context.Context) {
 	if m == nil {
 		return
 	}
-	m.statusUpdateFailure.Add(ctx, 1)
+	m.statusUpdateFailure.Add(ctx, 1, m.point())
 }
 
 func (m *Metrics) AddQueueDepth(ctx context.Context, delta int64) {
 	if m == nil {
 		return
 	}
-	m.queueDepth.Add(ctx, delta)
+	m.queueDepth.Add(ctx, delta, m.point())
 }
 
 func (m *Metrics) RecordQueueOldestItemAge(ctx context.Context, d time.Duration) {
 	if m == nil {
 		return
 	}
-	m.queueOldestItemAge.Record(ctx, d.Seconds())
+	m.queueOldestItemAge.Record(ctx, d.Seconds(), m.point())
 }
 
 func (m *Metrics) RecordConnectDuration(ctx context.Context, d time.Duration) {
 	if m == nil {
 		return
 	}
-	m.connectDuration.Record(ctx, d.Seconds())
+	m.connectDuration.Record(ctx, d.Seconds(), m.point())
 }
 
 func (m *Metrics) IncConnectFailure(ctx context.Context) {
 	if m == nil {
 		return
 	}
-	m.connectFailure.Add(ctx, 1)
+	m.connectFailure.Add(ctx, 1, m.point())
 }

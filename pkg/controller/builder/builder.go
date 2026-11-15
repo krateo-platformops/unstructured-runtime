@@ -120,6 +120,7 @@ func Build(ctx context.Context, conf Configuration, optsFuncs ...FuncOption) (*c
 		GracefulShutdownTimeout: opts.gracefulShutdownTimeout,
 		TracerProvider:          opts.tracerProvider,
 		Ownership:               ownership,
+		SpanAttributes:          opts.spanAttributes,
 	})
 	if err != nil {
 		opts.logger.Error(err, "failed to create controller")

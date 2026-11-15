@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/krateo-platformops/unstructured-runtime/pkg/ratelimit"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sync"
@@ -201,6 +202,12 @@ type Options struct {
 	// krateo.io/traceparent-continued marker. Mirrors provider-runtime's WithTracerProvider.
 	TracerProvider trace.TracerProvider
 
+	// SpanAttributes are set on every reconcile root span this controller starts, so a process that
+	// hosts several controllers (core-provider's cdc pool) keeps each one's traces attributable. The
+	// span already names the object (k8s.object.kind/name/namespace); these name the controller, e.g.
+	// krateo.composition.gvr. Nil: none, as before.
+	SpanAttributes []attribute.KeyValue
+
 	// Ownership makes Run reconcile only while it holds a coordination.k8s.io Lease, so a second
 	// process for the same resource waits instead of reconciling alongside. Nil: no Lease. See
 	// Ownership.
@@ -255,6 +262,8 @@ type Controller struct {
 	traces traceMemo
 	// tracerProv is Options.TracerProvider; nil reads telemetry.TracerProvider on every pass.
 	tracerProv trace.TracerProvider
+	// spanAttrs is Options.SpanAttributes, set on every reconcile root.
+	spanAttrs []attribute.KeyValue
 	// runCtx is the context Run was given, cancelled at SIGTERM. A worker waiting for a local slot
 	// waits on it, because reconcileCtx stays live through a drain.
 	runCtx context.Context
@@ -656,6 +665,7 @@ func New(sid *shortid.Shortid, opts Options) (*Controller, error) {
 		maxRetries:              opts.MaxRetries,
 		governor:                opts.RateLimitGovernor,
 		tracerProv:              opts.TracerProvider,
+		spanAttrs:               opts.SpanAttributes,
 		objects:                 newObjectGate(),
 		gracefulShutdownTimeout: gracefulShutdownTimeout,
 		ownership:               opts.Ownership,
