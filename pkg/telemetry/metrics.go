@@ -200,6 +200,23 @@ func NewWithMeter(meter metric.Meter, log logging.Logger, deploymentName string)
 	return newMetrics(meter, log, deploymentName)
 }
 
+// secondsBoundaries are the bucket upper bounds of every *_seconds histogram this package records.
+// Without them the SDK applies its default bounds, [0, 5, 10, 25, 50, 75, 100, 250, 500, 750, 1000,
+// 2500, 5000, 7500, 10000], which were chosen for MILLISECONDS: on a seconds metric every operation
+// under 5 s falls in one bucket, so a quantile reads only as a coarse upper bound (observability,
+// krateo-057, 2026-11-15: reconcile means of 2.8-7.9 s all reported p95 in the 75-250 s buckets).
+// These are the bounds the composition-dynamic-controller's own histograms already use (1 ms to
+// 10000 s), so the two families compare bucket for bucket. They are set on the instrument, so they
+// apply under any provider, including a caller's own (NewWithMeter); a provider View still overrides
+// them.
+var secondsBoundaries = []float64{
+	0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1,
+	2.5, 5, 10, 25, 50, 100, 250, 500, 1000,
+	2500, 5000, 10000,
+}
+
+var secondsBuckets = metric.WithExplicitBucketBoundaries(secondsBoundaries...)
+
 func newMetrics(meter metric.Meter, log logging.Logger, deploymentName string) (*Metrics, error) {
 	var err error
 	m := &Metrics{meters: &meters{
@@ -215,25 +232,25 @@ func newMetrics(meter metric.Meter, log logging.Logger, deploymentName string) (
 	if m.startupFailure, err = meter.Int64Counter("unstructured_runtime.startup.failure"); err != nil {
 		return nil, err
 	}
-	if m.getDuration, err = meter.Float64Histogram("unstructured_runtime.reconcile.get.duration_seconds"); err != nil {
+	if m.getDuration, err = meter.Float64Histogram("unstructured_runtime.reconcile.get.duration_seconds", secondsBuckets); err != nil {
 		return nil, err
 	}
 	if m.getFailure, err = meter.Int64Counter("unstructured_runtime.reconcile.get.failure"); err != nil {
 		return nil, err
 	}
-	if m.reconcileDuration, err = meter.Float64Histogram("unstructured_runtime.reconcile.duration_seconds"); err != nil {
+	if m.reconcileDuration, err = meter.Float64Histogram("unstructured_runtime.reconcile.duration_seconds", secondsBuckets); err != nil {
 		return nil, err
 	}
 	if m.queueDepth, err = meter.Int64UpDownCounter("unstructured_runtime.reconcile.queue.depth"); err != nil {
 		return nil, err
 	}
-	if m.queueWaitDuration, err = meter.Float64Histogram("unstructured_runtime.reconcile.queue.wait.duration_seconds"); err != nil {
+	if m.queueWaitDuration, err = meter.Float64Histogram("unstructured_runtime.reconcile.queue.wait.duration_seconds", secondsBuckets); err != nil {
 		return nil, err
 	}
-	if m.queueOldestItemAge, err = meter.Float64Histogram("unstructured_runtime.reconcile.queue.oldest_item_age_seconds"); err != nil {
+	if m.queueOldestItemAge, err = meter.Float64Histogram("unstructured_runtime.reconcile.queue.oldest_item_age_seconds", secondsBuckets); err != nil {
 		return nil, err
 	}
-	if m.queueWorkDuration, err = meter.Float64Histogram("unstructured_runtime.reconcile.queue.work.duration_seconds"); err != nil {
+	if m.queueWorkDuration, err = meter.Float64Histogram("unstructured_runtime.reconcile.queue.work.duration_seconds", secondsBuckets); err != nil {
 		return nil, err
 	}
 	if m.reconcileInFlight, err = meter.Int64ObservableGauge("unstructured_runtime.reconcile.in_flight"); err != nil {
@@ -257,49 +274,49 @@ func newMetrics(meter metric.Meter, log logging.Logger, deploymentName string) (
 	if m.queueRequeueTotal, err = meter.Int64Counter("unstructured_runtime.reconcile.queue.requeues"); err != nil {
 		return nil, err
 	}
-	if m.connectDuration, err = meter.Float64Histogram("unstructured_runtime.external.connect.duration_seconds"); err != nil {
+	if m.connectDuration, err = meter.Float64Histogram("unstructured_runtime.external.connect.duration_seconds", secondsBuckets); err != nil {
 		return nil, err
 	}
 	if m.connectFailure, err = meter.Int64Counter("unstructured_runtime.external.connect.failure"); err != nil {
 		return nil, err
 	}
-	if m.observeDuration, err = meter.Float64Histogram("unstructured_runtime.external.observe.duration_seconds"); err != nil {
+	if m.observeDuration, err = meter.Float64Histogram("unstructured_runtime.external.observe.duration_seconds", secondsBuckets); err != nil {
 		return nil, err
 	}
 	if m.observeFailure, err = meter.Int64Counter("unstructured_runtime.external.observe.failure"); err != nil {
 		return nil, err
 	}
-	if m.createDuration, err = meter.Float64Histogram("unstructured_runtime.external.create.duration_seconds"); err != nil {
+	if m.createDuration, err = meter.Float64Histogram("unstructured_runtime.external.create.duration_seconds", secondsBuckets); err != nil {
 		return nil, err
 	}
 	if m.createFailure, err = meter.Int64Counter("unstructured_runtime.external.create.failure"); err != nil {
 		return nil, err
 	}
-	if m.updateDuration, err = meter.Float64Histogram("unstructured_runtime.external.update.duration_seconds"); err != nil {
+	if m.updateDuration, err = meter.Float64Histogram("unstructured_runtime.external.update.duration_seconds", secondsBuckets); err != nil {
 		return nil, err
 	}
 	if m.updateFailure, err = meter.Int64Counter("unstructured_runtime.external.update.failure"); err != nil {
 		return nil, err
 	}
-	if m.deleteDuration, err = meter.Float64Histogram("unstructured_runtime.external.delete.duration_seconds"); err != nil {
+	if m.deleteDuration, err = meter.Float64Histogram("unstructured_runtime.external.delete.duration_seconds", secondsBuckets); err != nil {
 		return nil, err
 	}
 	if m.deleteFailure, err = meter.Int64Counter("unstructured_runtime.external.delete.failure"); err != nil {
 		return nil, err
 	}
-	if m.finalizerAddDuration, err = meter.Float64Histogram("unstructured_runtime.finalizer.add.duration_seconds"); err != nil {
+	if m.finalizerAddDuration, err = meter.Float64Histogram("unstructured_runtime.finalizer.add.duration_seconds", secondsBuckets); err != nil {
 		return nil, err
 	}
 	if m.finalizerAddFailure, err = meter.Int64Counter("unstructured_runtime.finalizer.add.failure"); err != nil {
 		return nil, err
 	}
-	if m.finalizerRemoveDuration, err = meter.Float64Histogram("unstructured_runtime.finalizer.remove.duration_seconds"); err != nil {
+	if m.finalizerRemoveDuration, err = meter.Float64Histogram("unstructured_runtime.finalizer.remove.duration_seconds", secondsBuckets); err != nil {
 		return nil, err
 	}
 	if m.finalizerRemoveFailure, err = meter.Int64Counter("unstructured_runtime.finalizer.remove.failure"); err != nil {
 		return nil, err
 	}
-	if m.statusUpdateDuration, err = meter.Float64Histogram("unstructured_runtime.status.update.duration_seconds"); err != nil {
+	if m.statusUpdateDuration, err = meter.Float64Histogram("unstructured_runtime.status.update.duration_seconds", secondsBuckets); err != nil {
 		return nil, err
 	}
 	if m.statusUpdateFailure, err = meter.Int64Counter("unstructured_runtime.status.update.failure"); err != nil {
