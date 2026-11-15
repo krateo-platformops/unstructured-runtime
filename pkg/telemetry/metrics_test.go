@@ -2,6 +2,7 @@ package telemetry
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -127,4 +128,62 @@ func hasMetric(rm metricdata.ResourceMetrics, name string) bool {
 	}
 
 	return false
+}
+
+// Every *_seconds histogram carries secondsBoundaries, not the SDK's millisecond-style defaults, and
+// a sub-second and a multi-second reconcile land in different buckets (under the defaults both fall
+// in [0, 5]).
+func TestSecondsHistogramsHaveSecondsBuckets(t *testing.T) {
+	reader := metric.NewManualReader()
+	provider := metric.NewMeterProvider(metric.WithReader(reader))
+	ctx := context.Background()
+	defer func() { _ = provider.Shutdown(ctx) }()
+	m, err := newMetrics(provider.Meter("test"), logging.NewNopLogger(), "test-deployment")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rec := range []func(context.Context, time.Duration){
+		m.RecordGetDuration, m.RecordQueueWaitDuration, m.RecordQueueOldestItemAge, m.RecordQueueWorkDuration,
+		m.RecordConnectDuration, m.RecordObserveDuration, m.RecordCreateDuration, m.RecordUpdateDuration,
+		m.RecordDeleteDuration, m.RecordFinalizerAddDuration, m.RecordFinalizerRemoveDuration, m.RecordStatusUpdateDuration,
+	} {
+		rec(ctx, 10*time.Millisecond)
+	}
+	m.RecordReconcileDuration(ctx, 300*time.Millisecond)
+	m.RecordReconcileDuration(ctx, 2800*time.Millisecond)
+
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &rm); err != nil {
+		t.Fatal(err)
+	}
+	seen := 0
+	for _, sm := range rm.ScopeMetrics {
+		for _, md := range sm.Metrics {
+			h, ok := md.Data.(metricdata.Histogram[float64])
+			if !ok {
+				continue
+			}
+			seen++
+			for _, dp := range h.DataPoints {
+				if fmt.Sprint(dp.Bounds) != fmt.Sprint(secondsBoundaries) {
+					t.Errorf("%s: bounds %v, want %v", md.Name, dp.Bounds, secondsBoundaries)
+				}
+				if md.Name != "unstructured_runtime.reconcile.duration_seconds" {
+					continue
+				}
+				nonEmpty := 0
+				for _, c := range dp.BucketCounts {
+					if c > 0 {
+						nonEmpty++
+					}
+				}
+				if nonEmpty != 2 {
+					t.Errorf("reconcile 0.3 s and 2.8 s: %d non-empty buckets %v, want 2", nonEmpty, dp.BucketCounts)
+				}
+			}
+		}
+	}
+	if seen != 13 {
+		t.Fatalf("histograms collected: %d, want 13 (every *_seconds instrument)", seen)
+	}
 }
