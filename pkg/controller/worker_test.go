@@ -313,7 +313,8 @@ func TestHandleCreate_SuccessAndFailure_SetAnnotationsAndConditions(t *testing.T
 	ref := objectref.ObjectRef{APIVersion: obj.GetAPIVersion(), Kind: obj.GetKind(), Name: obj.GetName(), Namespace: obj.GetNamespace()}
 
 	// Failure case: Create returns error -> annotation ExternalCreateFailed set and error returned
-	ctrl.SetExternalClient(&fakeExternalClient{CreateErr: errors.New("create failed")})
+	// Classified not committed: the failure-recording path is the one this test checks.
+	ctrl.SetExternalClient(&fakeExternalClient{CreateErr: CreateNotCommitted(errors.New("create failed"))})
 	err = ctrl.handleCreate(context.TODO(), ref)
 	require.Error(t, err)
 

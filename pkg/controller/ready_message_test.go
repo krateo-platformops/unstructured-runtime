@@ -66,7 +66,10 @@ func TestHandleCreate_FailurePutsTheDiagnosticOnReadyToo(t *testing.T) {
 	const refusal = `making request: Post "http://redirect-target:8080/v2.1/flavors": refusing to ` +
 		`follow a redirect: refusing to send a credentialed request to "redirect-target:8080": it ` +
 		`is not the document's server and is not in the operator's endpoint allowlist`
-	ctrl.SetExternalClient(&fakeExternalClient{CreateErr: errors.New(refusal)})
+	// A refusal to send is a create the vendor never received, so it is classified NOT COMMITTED and
+	// takes the failure-recording path this test is about (an unclassified error leaves the create
+	// pending instead; TestAnUnclassifiedFailureCarriesTheDiagnosticToo covers that arm).
+	ctrl.SetExternalClient(&fakeExternalClient{CreateErr: CreateNotCommitted(errors.New(refusal))})
 
 	require.Error(t, ctrl.handleCreate(context.TODO(), ref))
 

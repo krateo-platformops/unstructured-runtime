@@ -1314,15 +1314,24 @@ func (c *Controller) handleCreate(ctx context.Context, ref objectref.ObjectRef) 
 			return err
 		}
 
-		meta.SetExternalCreateFailed(el, time.Now())
-		el, err = tools.Update(ctx, el, tools.UpdateOptions{
-			Pluralizer:    c.pluralizer,
-			DynamicClient: c.dynamicClient,
-		})
-		if err != nil {
-			log.Error(err, "Cannot update managed resource")
-			c.recordEvent(el, event.Warning(reasonCannotUpdateManaged, actionUpdateManagedResource, err))
-			return err
+		// ONLY a create known NOT to have been committed is recorded as failed: the handler
+		// classified the error (ErrCreateNotCommitted), or a ResultCreator reported it requested
+		// nothing (Requested=false). Any other error may have reached the vendor: leaving
+		// external-create-pending the newest marker makes the next pass confirm the negative
+		// (processItem's incomplete-create recovery) before it ever creates again.
+		if createCommittedNot(actionErr) || !created.Requested {
+			meta.SetExternalCreateFailed(el, time.Now())
+			el, err = tools.Update(ctx, el, tools.UpdateOptions{
+				Pluralizer:    c.pluralizer,
+				DynamicClient: c.dynamicClient,
+			})
+			if err != nil {
+				log.Error(err, "Cannot update managed resource")
+				c.recordEvent(el, event.Warning(reasonCannotUpdateManaged, actionUpdateManagedResource, err))
+				return err
+			}
+		} else {
+			log.Info("Create outcome unknown: its existence is confirmed before any retry", "error", actionErr.Error())
 		}
 
 		// ONE error value for BOTH conditions. This is the site that produced the measured
