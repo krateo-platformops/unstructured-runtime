@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/krateo-platformops/plumbing/jqutil"
@@ -41,17 +42,91 @@ type Mapping struct {
 // unstructured.SetNestedField panics on).
 //
 // Errors are per-mapping and aggregated: a failing mapping degrades that one field; the
-// others still apply. Returns a joined error (nil if all succeeded).
+// others still apply. Returns a joined error (nil if all succeeded). ProjectReport is the same
+// pass, also saying what each mapping did.
 func Project(ctx context.Context, cr *unstructured.Unstructured, resolved map[string]any, mappings []Mapping) error {
+	_, err := ProjectReport(ctx, cr, resolved, mappings)
+	return err
+}
+
+// Outcome is what one mapping did to its field in one projection pass.
+type Outcome string
+
+const (
+	// Written: the expression produced a value and it was written. A null counts: it was
+	// written, and the apiserver drops a non-nullable null, so the field reads as absent.
+	Written Outcome = "Written"
+	// NoOutput: the expression produced no output (`// empty`, an empty iterator), so the field
+	// was left exactly as it was, including any value an earlier pass wrote.
+	NoOutput Outcome = "NoOutput"
+	// Failed: evaluating or writing failed, so the field was left exactly as it was.
+	Failed Outcome = "Failed"
+)
+
+// MappingResult is one mapping's outcome. Err is set when Outcome is Failed.
+type MappingResult struct {
+	ForPath string
+	Outcome Outcome
+	Err     error
+}
+
+// Report is what a projection pass did, one result per mapping in mapping order.
+type Report struct {
+	Results []MappingResult
+}
+
+// Unrefreshed returns the status paths (ForPath, as declared) whose field HOLDS a value in cr
+// that this pass did not write: no mapping for the path was Written, and status.<path> is
+// present and not null. Such a value is whatever an earlier pass left there, which a reader
+// cannot tell from a fresh one. A path with no value is not listed: there is nothing stale to
+// mistake for fresh. Sorted and de-duplicated, so the same pass gives the same list.
+//
+// Call it on the cr the pass wrote to, after ProjectReport.
+func (r Report) Unrefreshed(cr *unstructured.Unstructured) []string {
+	written := map[string]bool{}
+	for _, res := range r.Results {
+		if res.Outcome == Written {
+			written[res.ForPath] = true
+		}
+	}
+	seen := map[string]bool{}
+	out := []string{}
+	for _, res := range r.Results {
+		p := res.ForPath
+		if p == "" || written[p] || seen[p] {
+			continue
+		}
+		seen[p] = true
+		if cr == nil {
+			continue
+		}
+		v, found, err := unstructured.NestedFieldNoCopy(cr.Object, append([]string{"status"}, strings.Split(p, ".")...)...)
+		if err != nil || !found || v == nil {
+			continue
+		}
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ProjectReport is Project, also reporting each mapping's Outcome. The error is the same joined
+// per-mapping error Project returns.
+func ProjectReport(ctx context.Context, cr *unstructured.Unstructured, resolved map[string]any, mappings []Mapping) (Report, error) {
 	if cr == nil {
-		return fmt.Errorf("nil cr")
+		return Report{}, fmt.Errorf("nil cr")
 	}
 	root := buildRoot(cr, resolved)
 
+	report := Report{Results: make([]MappingResult, 0, len(mappings))}
 	var errs []error
+	fail := func(path string, err error) {
+		errs = append(errs, err)
+		report.Results = append(report.Results, MappingResult{ForPath: path, Outcome: Failed, Err: err})
+	}
 	for _, m := range mappings {
 		if m.ForPath == "" {
-			errs = append(errs, fmt.Errorf("mapping with empty forPath"))
+			fail("", fmt.Errorf("mapping with empty forPath"))
 			continue
 		}
 		// gojq normalizes numbers in its input map IN PLACE, so never hand it the live
@@ -62,24 +137,27 @@ func Project(ctx context.Context, cr *unstructured.Unstructured, resolved map[st
 		// degrades to a per-mapping error rather than crashing the worker goroutine.
 		dataCopy, err := safeDeepCopy(root)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("forPath %q: %w", m.ForPath, err))
+			fail(m.ForPath, fmt.Errorf("forPath %q: %w", m.ForPath, err))
 			continue
 		}
 		val, write, err := evalOne(ctx, m.Expression, dataCopy)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("forPath %q: %w", m.ForPath, err))
+			fail(m.ForPath, fmt.Errorf("forPath %q: %w", m.ForPath, err))
 			continue
 		}
 		if !write {
 			// The expression produced no output (e.g. iterating an empty array); leave the
 			// field unset rather than writing it.
+			report.Results = append(report.Results, MappingResult{ForPath: m.ForPath, Outcome: NoOutput})
 			continue
 		}
 		if err := setStatusField(cr, m.ForPath, val); err != nil {
-			errs = append(errs, fmt.Errorf("forPath %q: %w", m.ForPath, err))
+			fail(m.ForPath, fmt.Errorf("forPath %q: %w", m.ForPath, err))
+			continue
 		}
+		report.Results = append(report.Results, MappingResult{ForPath: m.ForPath, Outcome: Written})
 	}
-	return errors.Join(errs...)
+	return report, errors.Join(errs...)
 }
 
 // safeDeepCopy wraps runtime.DeepCopyJSONValue, which PANICS if v contains any value that is
