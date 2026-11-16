@@ -38,11 +38,15 @@ const (
 
 // Event reasons.
 const (
-	reasonCannotInitialize  event.Reason = "CannotInitializeManagedResource"
-	reasonCannotResolveRefs event.Reason = "CannotResolveResourceReferences"
-	reasonCannotObserve     event.Reason = "CannotObserveExternalResource"
-	reasonCannotCreate      event.Reason = "CannotCreateExternalResource"
-	reasonCannotDelete      event.Reason = "CannotDeleteExternalResource"
+	reasonCannotInitialize event.Reason = "CannotInitializeManagedResource"
+	// reasonCreateOutcomePending is distinct from reasonCannotInitialize on purpose: an operator
+	// filtering events needs to tell "transient, wait" from "needs a human", and both arrive on the
+	// same object from the same branch.
+	reasonCreateOutcomePending event.Reason = "CreateOutcomePending"
+	reasonCannotResolveRefs    event.Reason = "CannotResolveResourceReferences"
+	reasonCannotObserve        event.Reason = "CannotObserveExternalResource"
+	reasonCannotCreate         event.Reason = "CannotCreateExternalResource"
+	reasonCannotDelete         event.Reason = "CannotDeleteExternalResource"
 	// reasonReconcileDeferred: the rate-limit governor declined this pass. Normal, not Warning —
 	// nothing is wrong with the resource, and a Warning would page someone over a server's quota.
 	reasonReconcileDeferred   event.Reason = "ReconcileDeferred"
@@ -77,9 +81,15 @@ const (
 
 // Error strings.
 const (
-	errGetManaged                = "cannot get managed resource"
-	errUpdateManagedAnnotations  = "cannot update managed resource annotations"
-	errCreateIncomplete          = "cannot determine creation result - remove the " + meta.AnnotationKeyExternalCreatePending + " annotation if it is safe to proceed"
+	errGetManaged               = "cannot get managed resource"
+	errUpdateManagedAnnotations = "cannot update managed resource annotations"
+	errCreateIncomplete         = "cannot determine creation result - remove the " + meta.AnnotationKeyExternalCreatePending + " annotation if it is safe to proceed"
+	// errCreatePendingUndetermined is the MARKED counterpart of errCreateIncomplete, and it exists
+	// because that string's remediation is destructive for exactly the case a handler marks transient:
+	// it tells an operator to remove the create-pending annotation, which hands the resource back to a
+	// reconciler that will create it again. For a refusal the handler has declared transient, the
+	// correct instruction is to do nothing. Deliberately names no annotation and asks for no action.
+	errCreatePendingUndetermined = "a create is pending: its outcome could not be determined on this pass and is checked again"
 	errReconcileConnect          = "connect failed"
 	errReconcileObserve          = "observe failed"
 	errReconcileCreate           = "create failed"
@@ -676,10 +686,15 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 			// clearing the marker here would hand the resource back to a reconciler that would
 			// re-create it. That is the duplicate this whole branch exists to prevent.
 			if IsExistenceUndetermined(obsErr) {
-				wrapped := fmt.Errorf("%s: %w", errCreateIncomplete, obsErr)
+				// errCreatePendingUndetermined, NOT errCreateIncomplete. That string's remediation --
+				// "remove the external-create-pending annotation if it is safe to proceed" -- is the
+				// destructive intervention this branch exists to avoid, and putting it in the message for
+				// a refusal the handler just called transient would instruct an operator to cause the
+				// duplicate. The correct instruction here is to do nothing, so the text asks for nothing.
+				wrapped := fmt.Errorf("%s: %w", errCreatePendingUndetermined, obsErr)
 				lg.Info("Existence is undetermined on this pass and the handler declared it transient; "+
 					"requeueing rather than reporting an unknown create outcome", "error", obsErr.Error())
-				c.recordEvent(el, event.Warning(reasonCannotInitialize, actionProcessEvent, wrapped))
+				c.recordEvent(el, event.Warning(reasonCreateOutcomePending, actionProcessEvent, wrapped))
 
 				if cerr := unstructuredtools.SetConditions(el,
 					condition.Creating(),
