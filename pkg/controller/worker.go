@@ -38,11 +38,15 @@ const (
 
 // Event reasons.
 const (
-	reasonCannotInitialize  event.Reason = "CannotInitializeManagedResource"
-	reasonCannotResolveRefs event.Reason = "CannotResolveResourceReferences"
-	reasonCannotObserve     event.Reason = "CannotObserveExternalResource"
-	reasonCannotCreate      event.Reason = "CannotCreateExternalResource"
-	reasonCannotDelete      event.Reason = "CannotDeleteExternalResource"
+	reasonCannotInitialize event.Reason = "CannotInitializeManagedResource"
+	// reasonCreateOutcomePending is distinct from reasonCannotInitialize on purpose: an operator
+	// filtering events needs to tell "transient, wait" from "needs a human", and both arrive on the
+	// same object from the same branch.
+	reasonCreateOutcomePending event.Reason = "CreateOutcomePending"
+	reasonCannotResolveRefs    event.Reason = "CannotResolveResourceReferences"
+	reasonCannotObserve        event.Reason = "CannotObserveExternalResource"
+	reasonCannotCreate         event.Reason = "CannotCreateExternalResource"
+	reasonCannotDelete         event.Reason = "CannotDeleteExternalResource"
 	// reasonReconcileDeferred: the rate-limit governor declined this pass. Normal, not Warning —
 	// nothing is wrong with the resource, and a Warning would page someone over a server's quota.
 	reasonReconcileDeferred   event.Reason = "ReconcileDeferred"
@@ -77,9 +81,15 @@ const (
 
 // Error strings.
 const (
-	errGetManaged                = "cannot get managed resource"
-	errUpdateManagedAnnotations  = "cannot update managed resource annotations"
-	errCreateIncomplete          = "cannot determine creation result - remove the " + meta.AnnotationKeyExternalCreatePending + " annotation if it is safe to proceed"
+	errGetManaged               = "cannot get managed resource"
+	errUpdateManagedAnnotations = "cannot update managed resource annotations"
+	errCreateIncomplete         = "cannot determine creation result - remove the " + meta.AnnotationKeyExternalCreatePending + " annotation if it is safe to proceed"
+	// errCreatePendingUndetermined is the MARKED counterpart of errCreateIncomplete, and it exists
+	// because that string's remediation is destructive for exactly the case a handler marks transient:
+	// it tells an operator to remove the create-pending annotation, which hands the resource back to a
+	// reconciler that will create it again. For a refusal the handler has declared transient, the
+	// correct instruction is to do nothing. Deliberately names no annotation and asks for no action.
+	errCreatePendingUndetermined = "a create is pending: its outcome could not be determined on this pass and is checked again"
 	errReconcileConnect          = "connect failed"
 	errReconcileObserve          = "observe failed"
 	errReconcileCreate           = "create failed"
@@ -642,6 +652,67 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 			if statusConflict(obsErr) {
 				lg.Debug("Status write lost a race to a newer write; requeueing to recompute", "error", obsErr.Error())
 				return obsErr
+			}
+
+			// A MARKED REFUSAL IS TRANSIENT, AND MUST NOT GET CreateOutcomeUnknown.
+			//
+			// CreateOutcomeUnknown names a state a human must act on. A handler that has declared its
+			// refusal transient is saying the opposite: the check could not answer on this pass and a
+			// later one may. Applying the sticky reason to it tells an operator to intervene in
+			// something that is about to resolve itself. See ExistenceUndetermined for why the handler
+			// is the only layer that can make the distinction.
+			//
+			// THREE CHOICES HERE, AND EACH IS DELIBERATE:
+			//
+			// Ready=False/Creating -- the EXISTING reason and constructor, not a new one. It is
+			// non-sticky, so the next pass replaces it freely; it is TRUE, because a create really is
+			// pending behind this refusal; and core-provider's cdc already rolls it up as converging,
+			// so no consumer table changes. Deliberately NOT ObserveFailed: that is Ready=Unknown,
+			// which the cdc reads as unevaluated and rolls up HEALTHY -- a parent composition could go
+			// Ready over a create nobody has confirmed.
+			//
+			// Synced=False/ReconcileError carrying the cause AND that a create is pending behind it.
+			// A requeue with no condition change would leave whatever Ready held, which mid-create is
+			// usually Creating already -- indistinguishable from healthy progress. The operator needs
+			// to see the backend refusal; it is not an internal race like statusConflict above, which
+			// is why this does not borrow that path's silent return.
+			//
+			// RETURNING THE ERROR, so the queue backs off and re-checks rather than spinning. A marked
+			// refusal that never clears -- an async operation stuck forever -- therefore requeues
+			// indefinitely with backoff, and the condition message is the only thing telling an
+			// operator why. That is why the cause is named rather than summarised.
+			//
+			// The create-pending annotation is NOT touched: the create is still unresolved, and
+			// clearing the marker here would hand the resource back to a reconciler that would
+			// re-create it. That is the duplicate this whole branch exists to prevent.
+			if IsExistenceUndetermined(obsErr) {
+				// errCreatePendingUndetermined, NOT errCreateIncomplete. That string's remediation --
+				// "remove the external-create-pending annotation if it is safe to proceed" -- is the
+				// destructive intervention this branch exists to avoid, and putting it in the message for
+				// a refusal the handler just called transient would instruct an operator to cause the
+				// duplicate. The correct instruction here is to do nothing, so the text asks for nothing.
+				wrapped := fmt.Errorf("%s: %w", errCreatePendingUndetermined, obsErr)
+				lg.Info("Existence is undetermined on this pass and the handler declared it transient; "+
+					"requeueing rather than reporting an unknown create outcome", "error", obsErr.Error())
+				c.recordEvent(el, event.Warning(reasonCreateOutcomePending, actionProcessEvent, wrapped))
+
+				if cerr := unstructuredtools.SetConditions(el,
+					condition.Creating(),
+					condition.ReconcileError(wrapped),
+				); cerr != nil {
+					lg.Error(cerr, "Cannot set condition")
+					c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, cerr))
+					return cerr
+				}
+				if _, perr := tools.PatchStatusConditions(ctx, el, tools.UpdateOptions{
+					Pluralizer:    c.pluralizer,
+					DynamicClient: c.dynamicClient,
+				}); perr != nil {
+					lg.Error(perr, "Cannot update status")
+					c.recordEvent(el, event.Warning(reasonCannotUpdateManaged, actionUpdateManagedResource, perr))
+					return perr
+				}
+				return wrapped
 			}
 			wrapped := fmt.Errorf("%s: %w", errCreateIncomplete, obsErr)
 			lg.Warn(errCreateIncomplete, "error", obsErr.Error())
