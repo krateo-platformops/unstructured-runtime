@@ -83,13 +83,21 @@ const (
 const (
 	errGetManaged               = "cannot get managed resource"
 	errUpdateManagedAnnotations = "cannot update managed resource annotations"
-	errCreateIncomplete         = "cannot determine creation result - remove the " + meta.AnnotationKeyExternalCreatePending + " annotation if it is safe to proceed"
+	// errCreateIncomplete is the operator's whole instruction set for an unanswerable existence check,
+	// so it says the three things that cost a consumer 58 minutes of a hung `kubectl delete` (#107):
+	// deletion waits on it too; it clears BY ITSELF on the first resync whose check answers (the gate
+	// returns nil and the object is re-examined every resync); and removing the annotation is only for
+	// a check that can NEVER answer, after verifying the external resource. Diego, 2026-11-17: the gate
+	// keeps blocking, and once the cause is solved nothing needs a human.
+	errCreateIncomplete = "cannot determine creation result; reconciliation and deletion both wait for it, and it is checked again on every resync, " +
+		"clearing by itself once the existence check answers - remove the " + meta.AnnotationKeyExternalCreatePending +
+		" annotation only if that check can never answer, after verifying whether the external resource exists"
 	// errCreatePendingUndetermined is the MARKED counterpart of errCreateIncomplete, and it exists
 	// because that string's remediation is destructive for exactly the case a handler marks transient:
 	// it tells an operator to remove the create-pending annotation, which hands the resource back to a
 	// reconciler that will create it again. For a refusal the handler has declared transient, the
 	// correct instruction is to do nothing. Deliberately names no annotation and asks for no action.
-	errCreatePendingUndetermined = "a create is pending: its outcome could not be determined on this pass and is checked again"
+	errCreatePendingUndetermined = "a create is pending: its outcome could not be determined on this pass and is checked again; reconciliation and deletion wait until it is known"
 	errReconcileConnect          = "connect failed"
 	errReconcileObserve          = "observe failed"
 	errReconcileCreate           = "create failed"
