@@ -156,8 +156,9 @@ type aimd struct {
 // item that arrives meanwhile cannot overtake it. It waits for that worker, which is bounded by the
 // controller's own worker count and one pass, never by a requeue delay. Taking the slot after the pop
 // inverted priority WITHOUT bound in #72 only because a slot-less item was requeued with a delay and
-// lost the free slot to undelayed work; here it is never requeued. A pool keeps each member's own
-// worker count small (its spec.controller.workers, else 1), which keeps the bound small.
+// lost the free slot to undelayed work; here it is never requeued. So the bound is the sharing
+// controller's own worker count, in passes. In a composition-dynamic-controller pool that is the
+// member's spec.controller.workers, else the fleet default (10 on core-provider's chart).
 type SharedLocalGate interface {
 	LocalGate
 	SharedLocal() bool
