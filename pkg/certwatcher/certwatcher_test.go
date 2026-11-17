@@ -75,6 +75,12 @@ var _ = Describe("CertWatcher", func() {
 				err := watcher.ReadCertificate()
 				return err
 			}).Should(Succeed())
+			// AND till Start has registered its watches (unstructured-runtime#95). The read above is
+			// the test's own, and it also bumps read_certificate_total, so it says nothing about Start.
+			// A spec that removed or rewrote a file before Start's watcher.Add ran got no event at all
+			// (measured: 4 of 30 runs under one CPU, every failure with no fsnotify event after the
+			// remove) and could only be rescued by the poll interval, longer than its 4s wait.
+			Eventually(watcher.WatchedPaths).Should(ContainElements(certPath, keyPath))
 			return doneCh
 		}
 
