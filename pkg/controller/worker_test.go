@@ -494,7 +494,13 @@ func TestProcessItem_ExternalCreateIncomplete_RecoversViaObserve(t *testing.T) {
 			EventType: ctrlevent.Observe,
 			ObjectRef: objectref.ObjectRef{APIVersion: obj.GetAPIVersion(), Kind: obj.GetKind(), Name: obj.GetName(), Namespace: obj.GetNamespace()},
 		}
-		require.NoError(t, ctrl.processItem(context.TODO(), ev))
+		// #104: the pass RETURNS the re-observe as a requeue-after result instead of enqueueing it
+		// from inside, and handleErr (run by processNext after the pass end) re-adds it with its
+		// digest. Driven through both here, so a requeue that handleErr dropped still fails below.
+		perr := ctrl.processItem(context.TODO(), ev)
+		var again *requeueAfter
+		require.ErrorAs(t, perr, &again, "within the grace the pass must ask to be re-observed")
+		ctrl.handleErr(perr, ev, LowPriority)
 
 		got, err := opts.Client.Resource(opts.GVR).Namespace(opts.Namespace).Get(context.TODO(), obj.GetName(), metav1.GetOptions{})
 		require.NoError(t, err)
