@@ -179,10 +179,11 @@ const (
 // runWorker so the decision is testable without a running worker.
 func classifyOutcome(err error) passOutcome {
 	var deferred *ratelimit.DeferredError
+	var again *requeueAfter
 	switch {
 	case err == nil:
 		return outcomeSuccess
-	case errors.As(err, &deferred):
+	case errors.As(err, &deferred), errors.As(err, &again):
 		return outcomeDeferred
 	case statusConflict(err):
 		return outcomeStatusConflict
@@ -415,6 +416,22 @@ func (c *Controller) handleErr(err error, obj ctrlevent.Event, priority int) {
 	//	priority   kept, so a deferred high-priority event is not demoted by being deferred
 	//	Forget     not called by runWorker, because err is non-nil (#52), so a deferral leaves the
 	//	           item's genuine failure history exactly as it found it
+	// A PLANNED REQUEUE (#104): the pass asked to be run again after a delay, which is not a failure.
+	// Not rate-limited and not counted toward NumRequeues, like a deferral, and its digest is stored
+	// BEFORE the re-add so the waiting key dedups whatever arrives meanwhile.
+	var again *requeueAfter
+	if errors.As(err, &again) {
+		dig := ctrlevent.DigestForEvent(obj)
+		if _, loaded := c.items.LoadOrStore(dig, struct{}{}); !loaded {
+			c.queue.AddWithOpts(priorityqueue.AddOpts{
+				After:       again.after,
+				RateLimited: false,
+				Priority:    again.priority,
+			}, obj)
+		}
+		return
+	}
+
 	var deferred *ratelimit.DeferredError
 	if errors.As(err, &deferred) {
 		retryEvent := obj
@@ -534,7 +551,12 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 	}
 	ctx = withTracePass(ctx, pass)
 	defer func() {
-		telemetry.RecordSpanError(span, err)
+		spanErr := err
+		var again *requeueAfter
+		if errors.As(err, &again) {
+			spanErr = nil // a planned requeue is not an error on the trace
+		}
+		telemetry.RecordSpanError(span, spanErr)
 		span.End()
 	}()
 
@@ -805,15 +827,13 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 				"gracePeriod", externalCreateRecoveryGracePeriod.String())
 			// LowPriority: this is a patient background re-observe, not a user-urgent event — it must
 			// not crowd out genuine user Update/Delete work during a mass restart-mid-create.
-			c.queue.AddWithOpts(priorityqueue.AddOpts{
-				After:    externalCreateRecoveryReobserveInterval,
-				Priority: LowPriority,
-			}, ctrlevent.Event{
-				EventType: evt.EventType,
-				ObjectRef: evt.ObjectRef,
-				QueuedAt:  time.Now(),
-			})
-			return nil
+			//
+			// RETURNED, NOT ENQUEUED HERE (#104). An enqueue from inside the pass stored no digest,
+			// and could not usefully store one: it is this pass's own eventType+objectRef, which the
+			// pass end deletes (processNext's items.Delete) right after this returns. So the waiting
+			// key had no digest for its whole interval, and every dedup check against it passed.
+			// handleErr requeues it after that delete, storing the digest first, as it does a retry.
+			return &requeueAfter{after: externalCreateRecoveryReobserveInterval, priority: LowPriority}
 		} else {
 			mutate = func(o *unstructured.Unstructured) {
 				meta.RemoveAnnotations(o, meta.AnnotationKeyExternalCreatePending)
@@ -1886,3 +1906,13 @@ func (c *Controller) enqueueFollowUp(item ctrlevent.Event) {
 		Priority:    HighPriority,
 	}, item)
 }
+
+// requeueAfter is what a pass returns to be run again after a delay, as a RESULT rather than an
+// enqueue from inside the pass (#104). handleErr requeues it after the pass end has deleted the
+// pass's digest, storing the digest first, so the waiting key dedups events that arrive meanwhile.
+type requeueAfter struct {
+	after    time.Duration
+	priority int
+}
+
+func (r *requeueAfter) Error() string { return fmt.Sprintf("requeue after %s", r.after) }
