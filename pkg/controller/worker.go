@@ -213,15 +213,33 @@ func (c *Controller) acquireLocal() (func(), bool) {
 	return gate.AcquireLocal(runCtx)
 }
 
-// processNext runs one item, holding a local slot from before the pop until it is done, on every
-// path out. It reports whether the worker should carry on.
+// sharedLocal reports whether the governor is shared with other controllers (ratelimit.Options.Shared),
+// in which case the local slot is taken after the pop rather than before.
+func (c *Controller) sharedLocal() bool {
+	g, ok := c.governor.(ratelimit.SharedLocalGate)
+	return ok && g.SharedLocal()
+}
+
+// processNext runs one item, holding a local slot until it is done, on every path out. It reports
+// whether the worker should carry on.
+//
+// WHEN THE SLOT IS TAKEN depends on who else uses the governor. Owned by this controller alone, the
+// slot is taken BEFORE the pop (#72: low capacity then behaves like fewer workers, and the queue's
+// order is the order work runs in). Shared with other controllers (a cdc pool, core-provider#561), it
+// is taken AFTER the pop, with the item in hand: before it, this controller's idle worker would hold a
+// slot another controller with a backlog needs. The item is never requeued while it waits.
 func (c *Controller) processNext(ctx context.Context, workerID string) bool {
-	release, ok := c.acquireLocal()
-	if !ok {
-		c.logger.Info("Shutting down worker", "workerID", workerID)
-		return false
+	shared := c.sharedLocal()
+	release := func() {}
+	if !shared {
+		r, ok := c.acquireLocal()
+		if !ok {
+			c.logger.Info("Shutting down worker", "workerID", workerID)
+			return false
+		}
+		release = r
 	}
-	defer release()
+	defer func() { release() }()
 
 	obj, priority, shutdown := c.queue.GetWithPriority()
 	if shutdown {
@@ -238,6 +256,19 @@ func (c *Controller) processNext(ctx context.Context, workerID string) bool {
 			c.metrics.AddReconcileInFlight(-1)
 		}
 		return true
+	}
+
+	if shared {
+		r, ok := c.acquireLocal()
+		if !ok {
+			// Shutting down while waiting: the item goes back, so a drain that is cancelled before
+			// the queue shuts down loses nothing.
+			c.queue.AddWithOpts(priorityqueue.AddOpts{Priority: priority}, ev)
+			c.queue.Done(ev)
+			c.logger.Info("Shutting down worker", "workerID", workerID)
+			return false
+		}
+		release = r
 	}
 
 	if c.metrics != nil {
