@@ -1257,10 +1257,7 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 			},
 			QueuedAt: time.Now(),
 		}
-		c.queue.AddWithOpts(priorityqueue.AddOpts{
-			RateLimited: false,
-			Priority:    HighPriority,
-		}, item)
+		c.enqueueFollowUp(item)
 		return nil
 	} else if !observation.ResourceUpToDate {
 		persistHandlerConditions()
@@ -1274,10 +1271,7 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 			},
 			QueuedAt: time.Now(),
 		}
-		c.queue.AddWithOpts(priorityqueue.AddOpts{
-			RateLimited: false,
-			Priority:    HighPriority,
-		}, item)
+		c.enqueueFollowUp(item)
 		return nil
 	} else {
 		// DO NOT OVERRIDE A CONDITION THE HANDLER EXPLICITLY RETURNED (core-provider#241).
@@ -1870,4 +1864,25 @@ func hasConditionType(conds []metav1.Condition, t string) bool {
 		}
 	}
 	return false
+}
+
+// enqueueFollowUp queues the Create or Update an Observe pass decided on, unless the same event for the
+// same object is already pending (#101).
+//
+// THE DEDUP EVERY INFORMER PATH APPLIES, which this path used to skip. The queue key is the whole
+// Event, QueuedAt included, and the retry budget (NumRequeues) is per key. So an Observe that found
+// the resource absent while a Create for it was still in backoff added a SECOND Create key, with a
+// fresh budget: measured on rest-dynamic-controller as 12 vendor requests for one object where
+// 1+MaxRetries = 6 were configured, two keys of 6 (oasgen-provider#769). The digest is eventType +
+// objectRef, and handleErr stores it for a failed pass's retry, so a Create waiting out its backoff
+// holds it. A Create already pending makes another one redundant: it runs at its own backoff, which
+// is what a failing create should do.
+func (c *Controller) enqueueFollowUp(item ctrlevent.Event) {
+	if _, loaded := c.items.LoadOrStore(ctrlevent.DigestForEvent(item), struct{}{}); loaded {
+		return
+	}
+	c.queue.AddWithOpts(priorityqueue.AddOpts{
+		RateLimited: false,
+		Priority:    HighPriority,
+	}, item)
 }
