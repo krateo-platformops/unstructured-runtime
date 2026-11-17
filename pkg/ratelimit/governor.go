@@ -94,6 +94,19 @@ type Options struct {
 	// Now and Jitter are injectable for tests. Nil means time.Now and a real jitter.
 	Now    func() time.Time
 	Jitter func(time.Duration) time.Duration
+
+	// Shared declares that SEVERAL controllers in one process share this governor (a
+	// composition-dynamic-controller pool, core-provider#561). A governor owned by one controller
+	// leaves it false, and nothing about it changes. Shared changes three things:
+	//
+	//   - The local capacity is ENFORCED even with saturation off: Ceiling is the process total, the
+	//     concurrency every sharing controller's workers draw from. Saturation, when on, lowers it.
+	//   - A worker takes its local slot AFTER it pops, and waits for it with the item in hand (see
+	//     SharedLocalGate). Before the pop, an idle worker of one controller would hold a slot that
+	//     another controller with a backlog needs, which is why an unshared governor must not be
+	//     shared ("ONE GOVERNOR, ONE QUEUE" on LocalGate).
+	//   - Start is reference-counted: the sampler runs once, while at least one controller runs.
+	Shared bool
 }
 
 const (
@@ -125,6 +138,29 @@ type aimd struct {
 	localInFlight int
 	// localChanged is closed, under mu, whenever a slot frees or capacity changes, and replaced.
 	localChanged chan struct{}
+
+	// Shared only: the controllers that have called Start and not yet stopped, and the sampler's stop.
+	startMu     sync.Mutex
+	starters    int
+	stopSampler context.CancelFunc
+	// samplers counts running sampler loops, for tests.
+	samplers atomic.Int32
+}
+
+// SharedLocalGate is implemented by a governor that may be shared by several controllers
+// (Options.Shared). When SharedLocal reports true, a worker takes its local slot AFTER it pops and
+// waits for it with the item in hand, so a worker with nothing to do never holds capacity another
+// controller needs.
+//
+// THE COST, STATED: an item a worker holds while waiting is out of the queue, so a higher-priority
+// item that arrives meanwhile cannot overtake it. It waits for that worker, which is bounded by the
+// controller's own worker count and one pass, never by a requeue delay. Taking the slot after the pop
+// inverted priority WITHOUT bound in #72 only because a slot-less item was requeued with a delay and
+// lost the free slot to undelayed work; here it is never requeued. A pool keeps each member's own
+// worker count small (its spec.controller.workers, else 1), which keeps the bound small.
+type SharedLocalGate interface {
+	LocalGate
+	SharedLocal() bool
 }
 
 // Starter is implemented by a governor that has a background loop to run: with saturation on, the
@@ -160,10 +196,38 @@ func NewWithSaturation(o Options, s SaturationOptions, log logging.Logger) (Gove
 }
 
 // Start runs the saturation sampler until ctx is done. Without saturation it returns at once.
+//
+// A Shared governor is started by every controller that shares it (each one's Run calls Start). The
+// sampler then runs ONCE, from the first Start until the last of them ends, so one controller leaving
+// a pool neither stops sampling for the others nor, by starting again, doubles it.
 func (g *aimd) Start(ctx context.Context) error {
 	if g.sat == nil {
 		return nil
 	}
+	if !g.opts.Shared {
+		return g.runSampler(ctx)
+	}
+	g.startMu.Lock()
+	g.starters++
+	if g.starters == 1 {
+		sctx, cancel := context.WithCancel(context.Background())
+		g.stopSampler = cancel
+		go func() { _ = g.runSampler(sctx) }()
+	}
+	g.startMu.Unlock()
+	<-ctx.Done()
+	g.startMu.Lock()
+	g.starters--
+	if g.starters == 0 {
+		g.stopSampler()
+	}
+	g.startMu.Unlock()
+	return nil
+}
+
+func (g *aimd) runSampler(ctx context.Context) error {
+	g.samplers.Add(1)
+	defer g.samplers.Add(-1)
 	g.log.Info("Saturation sampler started", "cgroup", g.sat.dir, "samplePeriod", g.sat.opts.SamplePeriod.String())
 	g.sample()
 	t := time.NewTicker(g.sat.opts.SamplePeriod)
@@ -209,14 +273,29 @@ func (g *aimd) LocalCapacity() int {
 // LocalInput is the saturation input's last reading.
 func (g *aimd) LocalInput() InputSnapshot { return g.sat.snapshot() }
 
+// SharedLocal implements SharedLocalGate.
+func (g *aimd) SharedLocal() bool { return g.opts.Shared }
+
+// localCapacityNow is the capacity AcquireLocal enforces: the saturation capacity when saturation is
+// on, else the Ceiling for a Shared governor (the process total), else none (ok false).
+func (g *aimd) localCapacityNow() (int, bool) {
+	switch {
+	case g.sat != nil:
+		return g.local.Load().capacity, true
+	case g.opts.Shared:
+		return g.opts.Ceiling, true
+	}
+	return 0, false
+}
+
 // AcquireLocal implements LocalGate.
 func (g *aimd) AcquireLocal(ctx context.Context) (func(), bool) {
-	if g.sat == nil {
+	if _, enforced := g.localCapacityNow(); !enforced {
 		return func() {}, true
 	}
 	for {
 		g.mu.Lock()
-		if g.localInFlight < g.local.Load().capacity {
+		if capacity, _ := g.localCapacityNow(); g.localInFlight < capacity {
 			g.localInFlight++
 			g.mu.Unlock()
 			var once sync.Once
@@ -262,7 +341,11 @@ func New(o Options) Governor {
 	if o.Jitter == nil {
 		o.Jitter = jitter
 	}
-	return &aimd{keys: map[string]*keyState{}, opts: o}
+	g := &aimd{keys: map[string]*keyState{}, opts: o}
+	if o.Shared {
+		g.localChanged = make(chan struct{}) // AcquireLocal waits on it even with saturation off
+	}
+	return g
 }
 
 // state returns the key's state, creating it at full capacity. A key is unthrottled until something
