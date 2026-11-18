@@ -19,6 +19,29 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
 
+  # TESTS THAT NEED A REAL APISERVER (`//go:build envtest`). The fake dynamic client keeps
+  # resourceVersion fixed across updates, so anything that branches on it (UpdateFunc tells a resync
+  # from an edit by resourceVersion) cannot be measured with it (#110 D6). A tag-gated test that CI
+  # never runs passes for the wrong reason, so this job runs every envtest file, and the tests
+  # themselves fail rather than skip when KUBEBUILDER_ASSETS is missing.
+  envtest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - name: Install setup-envtest
+        run: go install sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.22
+      - name: Run envtest-tagged tests
+        run: |
+          set -euo pipefail
+          export KUBEBUILDER_ASSETS="$(setup-envtest use 1.36.0 -p path)"
+          files=$(grep -rl '^//go:build envtest' --include='*_test.go' . | wc -l)
+          echo "envtest files: $files"
+          test "$files" -gt 0
+          go test -tags envtest -count=1 ./...
+
   # A FORMATTING AND TIDINESS GATE, which this repo did not have.
   #
   # Three files on main were not gofmt-clean when this was added — pkg/controller/builder/builder.go,

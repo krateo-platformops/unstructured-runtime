@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/krateo-platformops/unstructured-runtime/pkg/controller/event"
+	"github.com/krateo-platformops/unstructured-runtime/pkg/meta"
 	"github.com/krateo-platformops/unstructured-runtime/pkg/metrics/server"
 	"github.com/krateo-platformops/unstructured-runtime/pkg/pluralizer"
 	"github.com/krateo-platformops/unstructured-runtime/pkg/workqueue"
@@ -134,4 +135,26 @@ func TestNew_ReturnsController(t *testing.T) {
 	)
 	require.NoError(t, err)
 	require.NotNil(t, c)
+}
+
+// #110 D6: both policy annotations are watched by default (Observe on any change), so an
+// annotation-only edit is reconciled at once instead of at the next resync. The existing defaults
+// stay. CONTROL: an annotation nobody watches is not in the set, so the assertion can fail.
+func TestDefaultOptions_WatchThePolicyAnnotations(t *testing.T) {
+	o := defaultOptions()
+	for _, a := range []string{
+		meta.AnnotationKeyManagementPolicy,
+		meta.AnnotationKeyDeletionPolicy,
+		meta.AnnotationKeyReconciliationPaused,
+		meta.AnnotationKeyExternalCreatePending,
+	} {
+		require.True(t, o.watchAnnotations.HasAnnotation(a), "default watch set lacks %s", a)
+	}
+	for _, ev := range o.watchAnnotations {
+		if ev.Annotation == meta.AnnotationKeyManagementPolicy || ev.Annotation == meta.AnnotationKeyDeletionPolicy {
+			require.Equal(t, event.Observe, ev.EventType, "%s must queue an Observe pass", ev.Annotation)
+			require.Equal(t, event.OnAny, ev.OnAction, "%s must react to set, change and removal", ev.Annotation)
+		}
+	}
+	require.False(t, o.watchAnnotations.HasAnnotation("example.org/not-watched"), "control: an unwatched annotation reads as watched")
 }

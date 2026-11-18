@@ -67,6 +67,12 @@ func defaultOptions() options {
 	watchAnnotations := ctrlevent.NewAnnotationEvents()
 	watchAnnotations.Add(ctrlevent.Observe, meta.AnnotationKeyReconciliationPaused, ctrlevent.OnAny, false)
 	watchAnnotations.Add(ctrlevent.Create, meta.AnnotationKeyExternalCreatePending, ctrlevent.OnDelete, false)
+	// #110 D6 (Diego, 2026-11-18: react at once): an edit of either policy annotation is an
+	// annotation-only update, which UpdateFunc ignores unless the annotation is watched (no spec diff),
+	// so a new policy used to take effect only at the next resync. Observe on any change applies it
+	// now; anything already queued is still checked by the dispatch gate in processItem.
+	watchAnnotations.Add(ctrlevent.Observe, meta.AnnotationKeyManagementPolicy, ctrlevent.OnAny, false)
+	watchAnnotations.Add(ctrlevent.Observe, meta.AnnotationKeyDeletionPolicy, ctrlevent.OnAny, false)
 
 	return options{
 		resyncInterval: 3 * time.Minute,
