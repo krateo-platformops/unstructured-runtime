@@ -327,7 +327,7 @@ func TestGetExternalCreatePending(t *testing.T) {
 		want time.Time
 	}{
 		"ExternalCreatePendingExists": {
-			o:    &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{AnnotationKeyExternalCreatePending: now.Format(time.RFC3339)}}},
+			o:    &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{AnnotationKeyExternalCreatePending: now.UTC().Format(time.RFC3339)}}},
 			want: now,
 		},
 		"NoExternalCreatePending": {
@@ -357,7 +357,7 @@ func TestSetExternalCreatePending(t *testing.T) {
 		"SetsTheCorrectKey": {
 			o:    &corev1.Pod{},
 			t:    now,
-			want: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{AnnotationKeyExternalCreatePending: now.Format(time.RFC3339)}}},
+			want: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{AnnotationKeyExternalCreatePending: now.UTC().Format(time.RFC3339)}}},
 		},
 	}
 
@@ -379,7 +379,7 @@ func TestGetExternalCreateSucceeded(t *testing.T) {
 		want time.Time
 	}{
 		"ExternalCreateTimeExists": {
-			o:    &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{AnnotationKeyExternalCreateSucceeded: now.Format(time.RFC3339)}}},
+			o:    &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{AnnotationKeyExternalCreateSucceeded: now.UTC().Format(time.RFC3339)}}},
 			want: now,
 		},
 		"NoExternalCreateTime": {
@@ -409,7 +409,7 @@ func TestSetExternalCreateSucceeded(t *testing.T) {
 		"SetsTheCorrectKey": {
 			o:    &corev1.Pod{},
 			t:    now,
-			want: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{AnnotationKeyExternalCreateSucceeded: now.Format(time.RFC3339)}}},
+			want: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{AnnotationKeyExternalCreateSucceeded: now.UTC().Format(time.RFC3339)}}},
 		},
 	}
 
@@ -431,7 +431,7 @@ func TestGetExternalCreateFailed(t *testing.T) {
 		want time.Time
 	}{
 		"ExternalCreateFailedExists": {
-			o:    &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{AnnotationKeyExternalCreateFailed: now.Format(time.RFC3339)}}},
+			o:    &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{AnnotationKeyExternalCreateFailed: now.UTC().Format(time.RFC3339)}}},
 			want: now,
 		},
 		"NoExternalCreateFailed": {
@@ -461,7 +461,7 @@ func TestSetExternalCreateFailed(t *testing.T) {
 		"SetsTheCorrectKey": {
 			o:    &corev1.Pod{},
 			t:    now,
-			want: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{AnnotationKeyExternalCreateFailed: now.Format(time.RFC3339)}}},
+			want: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{AnnotationKeyExternalCreateFailed: now.UTC().Format(time.RFC3339)}}},
 		},
 	}
 
