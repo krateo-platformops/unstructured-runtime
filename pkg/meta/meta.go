@@ -353,7 +353,12 @@ func IsVerbose(o metav1.Object) bool {
 	return o.GetAnnotations()[AnnotationKeyConnectorVerbose] == "true"
 }
 
-// IsActionAllowed determines if action is allowed to be performed on Object
+// IsActionAllowed determines if action is allowed to be performed on Object.
+//
+// Deprecated: nothing in this runtime calls it, and it disagrees with what the runtime does: for
+// delete it ignores krateo.io/deletion-policy, which ShouldDelete honours. A probe that grepped for it
+// found 0 call sites and nearly reported the management-policy gate as dead (aruba-provider-kog,
+// #110). Use ShouldCreate, ShouldUpdate and ShouldDelete, which are what the worker consults.
 func IsActionAllowed(o metav1.Object, action string) bool {
 	p := o.GetAnnotations()[AnnotationKeyManagementPolicy]
 	if len(p) == 0 {
