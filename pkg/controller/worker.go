@@ -45,8 +45,13 @@ const (
 	reasonCreateOutcomePending event.Reason = "CreateOutcomePending"
 	reasonCannotResolveRefs    event.Reason = "CannotResolveResourceReferences"
 	reasonCannotObserve        event.Reason = "CannotObserveExternalResource"
-	reasonCannotCreate         event.Reason = "CannotCreateExternalResource"
-	reasonCannotDelete         event.Reason = "CannotDeleteExternalResource"
+	// reasonAbsentUnderPolicy is the management policy `observe` meeting an absent external resource
+	// (#110). It is NOT reasonCannotObserve: that reason is the generic observe ERROR (a transport
+	// failure, a 5xx, a handler's "created but no identifier recorded, it may exist unreferenced"),
+	// and this is a declaration the operator made, which an alert must be able to tell apart.
+	reasonAbsentUnderPolicy event.Reason = "ExternalResourceAbsentUnderPolicy"
+	reasonCannotCreate      event.Reason = "CannotCreateExternalResource"
+	reasonCannotDelete      event.Reason = "CannotDeleteExternalResource"
 	// reasonReconcileDeferred: the rate-limit governor declined this pass. Normal, not Warning —
 	// nothing is wrong with the resource, and a Warning would page someone over a server's quota.
 	reasonReconcileDeferred   event.Reason = "ReconcileDeferred"
@@ -1296,7 +1301,7 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 	// reference Diego chose (2026-11-18):
 	//
 	//   - absent, policy `observe`: an error. The resource is supposed to exist and be observed;
-	//     Synced=False/ReconcileError and a CannotObserveExternalResource warning say it does not,
+	//     Synced=False/ReconcileError and an ExternalResourceAbsentUnderPolicy warning say it does not,
 	//     and the pass is retried (provider-runtime reconciler.go ShouldOnlyObserve).
 	//   - absent, create not allowed (`observe-delete`): nothing is created, the pass succeeds.
 	//   - drifted, update not allowed (`observe`, `observe-delete`): nothing is updated, the pass
@@ -1307,7 +1312,7 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 	if !observation.ResourceExists && meta.ShouldOnlyObserve(el) {
 		persistHandlerConditions()
 		passErr := errors.Wrap(errors.New(errExternalResourceNotExist), errReconcileObserve)
-		c.recordEvent(el, event.Warning(reasonCannotObserve, actionObserveExternalResource, passErr))
+		c.recordEvent(el, event.Warning(reasonAbsentUnderPolicy, actionObserveExternalResource, passErr))
 		if err := unstructuredtools.SetConditions(el, condition.ReconcileError(passErr)); err != nil {
 			log.Error(err, "Cannot set condition")
 			c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))

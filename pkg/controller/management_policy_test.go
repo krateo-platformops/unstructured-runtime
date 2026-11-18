@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -119,4 +120,53 @@ func TestManagementPolicy_GatesCreateAndUpdate(t *testing.T) {
 			require.Equal(t, tc.wantFollowUp, queued, "follow-up %s queued", followUp)
 		})
 	}
+}
+
+// erroringObserveClient fails Observe, as a transport error or a handler's "created but no
+// identifier recorded" does.
+type erroringObserveClient struct{ recordingExternalClient }
+
+func (e *erroringObserveClient) Observe(ctx context.Context, mg *unstructured.Unstructured) (ExternalObservation, error) {
+	e.observed++
+	return ExternalObservation{}, fmt.Errorf("the create reported success but no identifier was recorded")
+}
+
+// #110, oasgen-provider's finding on v1.28.0: an absent resource under `observe` is a declaration
+// the operator made, and must not share CannotObserveExternalResource, the generic observe-ERROR
+// reason that also covers "the external resource MAY EXIST unreferenced". CONTROL: a failing Observe
+// still emits CannotObserveExternalResource, so the first arm is not a reason that changed everywhere.
+func TestManagementPolicy_AbsentUnderObserveHasItsOwnReason(t *testing.T) {
+	reasons := func(t *testing.T, cli ExternalClient, policy string) []string {
+		t.Helper()
+		sid, err := shortid.New(1, shortid.DefaultABC, 2342)
+		require.NoError(t, err)
+		opts := createTestOptions()
+		rec, throttled := &mockEventRecorder{}, &mockEventRecorder{}
+		opts.Recorder, opts.ThrottledRecorder = rec, throttled
+		ctrl, err := New(sid, opts)
+		require.NoError(t, err)
+		ctrl.externalClient = cli
+		obj := createTestUnstructured("reason-"+policy, opts.Namespace)
+		obj.SetAnnotations(map[string]string{meta.AnnotationKeyManagementPolicy: policy})
+		obj.SetFinalizers([]string{finalizerName})
+		created, err := opts.Client.Resource(opts.GVR).Namespace(opts.Namespace).Create(context.TODO(), obj, metav1.CreateOptions{})
+		require.NoError(t, err)
+		ref := objectref.ObjectRef{APIVersion: created.GetAPIVersion(), Kind: created.GetKind(), Name: created.GetName(), Namespace: created.GetNamespace()}
+		_ = ctrl.processItem(context.TODO(), ctrlevent.Event{EventType: ctrlevent.Observe, ObjectRef: ref})
+		var out []string
+		for _, r := range []*mockEventRecorder{rec, throttled} {
+			r.mu.Lock()
+			for _, e := range r.events {
+				out = append(out, string(e.Reason))
+			}
+			r.mu.Unlock()
+		}
+		return out
+	}
+	got := reasons(t, &observingClient{obs: ExternalObservation{ResourceExists: false}}, meta.ManagementPolicyObserve)
+	require.Contains(t, got, "ExternalResourceAbsentUnderPolicy")
+	require.NotContains(t, got, "CannotObserveExternalResource")
+
+	ctrl := reasons(t, &erroringObserveClient{}, meta.ManagementPolicyDefault)
+	require.Contains(t, ctrl, "CannotObserveExternalResource", "control: a failing Observe keeps the generic reason")
 }

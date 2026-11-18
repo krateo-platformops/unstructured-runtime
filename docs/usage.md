@@ -109,7 +109,7 @@ mirror provider-runtime's managed reconciler and are pinned by `pkg/controller/t
 | `default` (or unset) | create | update | delete, or orphan with `deletion-policy: orphan` |
 | `observe-create-update` | create | update | orphan |
 | `observe-delete` | nothing, `Synced=True` | nothing, `Synced=True` | delete |
-| `observe` | `Synced=False/ReconcileError` "external resource does not exist", `CannotObserveExternalResource` event | nothing, `Synced=True` | orphan |
+| `observe` | `Synced=False/ReconcileError` "external resource does not exist", `ExternalResourceAbsentUnderPolicy` event (v1.28.1; v1.28.0 used `CannotObserveExternalResource`, the generic observe-error reason) | nothing, `Synced=True` | orphan |
 
 A withheld verb is withheld whichever way it arrives: from the observe pass, from a CR update
 (dispatched as `Update` by default), or from removing `krateo.io/external-create-pending`. It is

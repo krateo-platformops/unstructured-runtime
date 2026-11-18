@@ -59,17 +59,17 @@ observe-delete	orphan	up-to-date	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-
 observe-delete	orphan	drifted	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
 observe-delete	orphan	deleting-present	0	0	0	1	true	False	Deleting	-	True	ReconcileSuccess	-	DeletedExternalResource	-	resync
 observe-delete	orphan	deleting-absent	0	0	0	1	true	False	Deleting	-	True	ReconcileSuccess	-	DeletedExternalResource	-	resync
-observe	unset	absent	1	0	0	0	false	-	-	-	False	ReconcileError	observe failed: external resource does not exist	CannotObserveExternalResource	observe failed: external resource does not exist	rate-limited
+observe	unset	absent	1	0	0	0	false	-	-	-	False	ReconcileError	observe failed: external resource does not exist	ExternalResourceAbsentUnderPolicy	observe failed: external resource does not exist	rate-limited
 observe	unset	up-to-date	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
 observe	unset	drifted	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
 observe	unset	deleting-present	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
 observe	unset	deleting-absent	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
-observe	delete	absent	1	0	0	0	false	-	-	-	False	ReconcileError	observe failed: external resource does not exist	CannotObserveExternalResource	observe failed: external resource does not exist	rate-limited
+observe	delete	absent	1	0	0	0	false	-	-	-	False	ReconcileError	observe failed: external resource does not exist	ExternalResourceAbsentUnderPolicy	observe failed: external resource does not exist	rate-limited
 observe	delete	up-to-date	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
 observe	delete	drifted	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
 observe	delete	deleting-present	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
 observe	delete	deleting-absent	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
-observe	orphan	absent	1	0	0	0	false	-	-	-	False	ReconcileError	observe failed: external resource does not exist	CannotObserveExternalResource	observe failed: external resource does not exist	rate-limited
+observe	orphan	absent	1	0	0	0	false	-	-	-	False	ReconcileError	observe failed: external resource does not exist	ExternalResourceAbsentUnderPolicy	observe failed: external resource does not exist	rate-limited
 observe	orphan	up-to-date	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
 observe	orphan	drifted	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
 observe	orphan	deleting-present	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
