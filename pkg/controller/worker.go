@@ -912,6 +912,20 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 		return merr
 	}
 
+	// THE MANAGEMENT POLICY GATES THE DISPATCH, not only handleObserve's follow-up (#110 Phase 0).
+	// A Create or Update reaches this switch from three sources: handleObserve's follow-up, the
+	// informer (CRUpdated maps to Update by default, event/actionsevent.go), and the watched
+	// annotations (removing external-create-pending enqueues a Create, builder/options.go). Gating
+	// only handleObserve left the second and third calling the handler's Create/Update on a
+	// resource whose policy forbids it. A withheld verb is dispatched as Observe instead, and
+	// handleObserve applies the policy's outcome (an error for observe-only on an absent resource,
+	// success otherwise), so there is one place that decides it.
+	if (evt.EventType == ctrlevent.Create && !meta.ShouldCreate(el)) || (evt.EventType == ctrlevent.Update && !meta.ShouldUpdate(el)) {
+		lg.Debug("Dispatching as Observe: the management policy does not allow this verb",
+			"verb", evt.EventType, "policy", el.GetAnnotations()[meta.AnnotationKeyManagementPolicy])
+		evt.EventType = ctrlevent.Observe
+	}
+
 	lg.Debug("Start processing")
 	switch evt.EventType {
 	case ctrlevent.Create:
@@ -1273,7 +1287,44 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 		el = updated
 	}
 
-	if !observation.ResourceExists {
+	// THE MANAGEMENT POLICY GATES CREATE AND UPDATE HERE (unstructured-runtime#110, Phase 0).
+	//
+	// krateo.io/management-policy was documented (docs/usage.md) as restricting which phases act,
+	// and only delete honoured it (ShouldDelete in processItem): a resource annotated `observe` was
+	// still created and updated. Upstream krateoplatformops/unstructured-runtime#58 fixed this; the
+	// fork never carried it. The outcomes mirror provider-runtime's managed reconciler, the
+	// reference Diego chose (2026-11-18):
+	//
+	//   - absent, policy `observe`: an error. The resource is supposed to exist and be observed;
+	//     Synced=False/ReconcileError and a CannotObserveExternalResource warning say it does not,
+	//     and the pass is retried (provider-runtime reconciler.go ShouldOnlyObserve).
+	//   - absent, create not allowed (`observe-delete`): nothing is created, the pass succeeds.
+	//   - drifted, update not allowed (`observe`, `observe-delete`): nothing is updated, the pass
+	//     succeeds (provider-runtime: "Skipping update due to managementPolicies").
+	createWithheld := !observation.ResourceExists && !meta.ShouldCreate(el)
+	updateWithheld := observation.ResourceExists && !observation.ResourceUpToDate && !meta.ShouldUpdate(el)
+
+	if !observation.ResourceExists && meta.ShouldOnlyObserve(el) {
+		persistHandlerConditions()
+		passErr := errors.Wrap(errors.New(errExternalResourceNotExist), errReconcileObserve)
+		c.recordEvent(el, event.Warning(reasonCannotObserve, actionObserveExternalResource, passErr))
+		if err := unstructuredtools.SetConditions(el, condition.ReconcileError(passErr)); err != nil {
+			log.Error(err, "Cannot set condition")
+			c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))
+			return err
+		}
+		if _, err := tools.PatchStatusConditions(ctx, el, tools.UpdateOptions{
+			Pluralizer:    c.pluralizer,
+			DynamicClient: c.dynamicClient,
+		}); err != nil {
+			log.Error(err, "Cannot update status")
+			c.recordEvent(el, event.Warning(reasonCannotUpdateManaged, actionUpdateManagedResource, err))
+			return err
+		}
+		return passErr
+	}
+
+	if !observation.ResourceExists && !createWithheld {
 		persistHandlerConditions()
 		item := ctrlevent.Event{
 			EventType: ctrlevent.Create,
@@ -1287,7 +1338,7 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 		}
 		c.enqueueFollowUp(item)
 		return nil
-	} else if !observation.ResourceUpToDate {
+	} else if observation.ResourceExists && !observation.ResourceUpToDate && !updateWithheld {
 		persistHandlerConditions()
 		item := ctrlevent.Event{
 			EventType: ctrlevent.Update,
@@ -1332,7 +1383,14 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 			c.recordEvent(el, event.Warning(reasonCannotUpdateManaged, actionUpdateManagedResource, err))
 			return err
 		}
-		log.Info("External resource is up to date")
+		switch {
+		case createWithheld:
+			log.Info("External resource does not exist, and the management policy does not allow create; nothing created", "policy", el.GetAnnotations()[meta.AnnotationKeyManagementPolicy])
+		case updateWithheld:
+			log.Info("External resource is not up to date, and the management policy does not allow update; nothing updated", "policy", el.GetAnnotations()[meta.AnnotationKeyManagementPolicy])
+		default:
+			log.Info("External resource is up to date")
+		}
 	}
 
 	return nil

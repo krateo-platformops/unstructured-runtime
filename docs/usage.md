@@ -92,10 +92,29 @@ The runtime reads these annotations on every managed CR (all in
 |---|---|
 | `krateo.io/paused: "true"` | pause reconciliation (condition `ReconcilePaused`); remove to resume |
 | `krateo.io/deletion-policy: orphan\|delete` | on CR delete, leave or delete the external resource (default: delete) |
-| `krateo.io/management-policy: default\|observe\|observe-create-update\|observe-delete` | restrict which phases may act |
+| `krateo.io/management-policy: default\|observe\|observe-create-update\|observe-delete` | restrict which phases may act (below) |
 | `krateo.io/external-name` | name of the resource on the external system |
 | `krateo.io/external-create-pending\|-succeeded\|-failed` | the create handshake — **managed by the runtime**; deleting `-pending` by hand queues a fresh Create (recovery lever) |
 | `krateo.io/traceparent`, `krateo.io/tracestate` | W3C trace context continued across the composition tree |
+
+### What each management policy does
+
+Since #110 Phase 0, create and update honour the policy, as delete always did. Before that, only
+delete honoured it: a resource annotated `observe` was still created and updated. The outcomes
+mirror provider-runtime's managed reconciler and are pinned by `pkg/controller/testdata/management-policy-table.tsv`
+(policy × deletion policy × state):
+
+| policy | absent | drifted | on CR delete |
+|---|---|---|---|
+| `default` (or unset) | create | update | delete, or orphan with `deletion-policy: orphan` |
+| `observe-create-update` | create | update | orphan |
+| `observe-delete` | nothing, `Synced=True` | nothing, `Synced=True` | delete |
+| `observe` | `Synced=False/ReconcileError` "external resource does not exist", `CannotObserveExternalResource` event | nothing, `Synced=True` | orphan |
+
+A withheld verb is withheld whichever way it arrives: from the observe pass, from a CR update
+(dispatched as `Update` by default), or from removing `krateo.io/external-create-pending`. It is
+dispatched as Observe instead. An unknown value currently acts like `observe-delete` minus the
+delete: no create, no update, orphan on delete. #110 (D2) makes it an explicit refusal.
 
 ## Who consumes it
 
