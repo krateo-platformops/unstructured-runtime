@@ -229,8 +229,18 @@ func GetExternalCreatePending(o metav1.Object) time.Time {
 
 // SetExternalCreatePending sets the time at which the external resource was
 // most recently pending creation to the supplied time.
+// markerTime is how every external-create marker is written: RFC3339 in UTC, at second precision.
+// UTC because a process with TZ set used to write its local offset (2026-11-18T19:50:00+01:00), so a
+// downstream tool that compared marker STRINGS could order a latched create wrongly (measured by
+// aruba-provider-kog; provider-runtime#110 is the same fix there). Second precision is kept on
+// purpose (Diego, 2026-11-18): ExternalCreateIncomplete's tie rule is second-granular. Readers must
+// still compare PARSED times, never strings: values written by an earlier runtime carry an offset.
+func markerTime(t time.Time) string {
+	return t.UTC().Format(time.RFC3339)
+}
+
 func SetExternalCreatePending(o metav1.Object, t time.Time) {
-	AddAnnotations(o, map[string]string{AnnotationKeyExternalCreatePending: t.Format(time.RFC3339)})
+	AddAnnotations(o, map[string]string{AnnotationKeyExternalCreatePending: markerTime(t)})
 }
 
 // GetExternalCreateSucceeded returns the time at which the external resource
@@ -247,7 +257,7 @@ func GetExternalCreateSucceeded(o metav1.Object) time.Time {
 // SetExternalCreateSucceeded sets the time at which the external resource was
 // most recently created to the supplied time.
 func SetExternalCreateSucceeded(o metav1.Object, t time.Time) {
-	AddAnnotations(o, map[string]string{AnnotationKeyExternalCreateSucceeded: t.Format(time.RFC3339)})
+	AddAnnotations(o, map[string]string{AnnotationKeyExternalCreateSucceeded: markerTime(t)})
 }
 
 // GetExternalCreateFailed returns the time at which the external resource
@@ -264,7 +274,7 @@ func GetExternalCreateFailed(o metav1.Object) time.Time {
 // SetExternalCreateFailed sets the time at which the external resource most
 // recently failed to create.
 func SetExternalCreateFailed(o metav1.Object, t time.Time) {
-	AddAnnotations(o, map[string]string{AnnotationKeyExternalCreateFailed: t.Format(time.RFC3339)})
+	AddAnnotations(o, map[string]string{AnnotationKeyExternalCreateFailed: markerTime(t)})
 }
 
 // GetExternalCreateNotRequested returns the time at which a create pass most recently ended without
@@ -281,7 +291,7 @@ func GetExternalCreateNotRequested(o metav1.Object) time.Time {
 // SetExternalCreateNotRequested sets the time at which a create pass most recently ended without
 // requesting a create.
 func SetExternalCreateNotRequested(o metav1.Object, t time.Time) {
-	AddAnnotations(o, map[string]string{AnnotationKeyExternalCreateNotRequested: t.Format(time.RFC3339)})
+	AddAnnotations(o, map[string]string{AnnotationKeyExternalCreateNotRequested: markerTime(t)})
 }
 
 // ExternalCreateIncomplete returns true if creation of the external resource

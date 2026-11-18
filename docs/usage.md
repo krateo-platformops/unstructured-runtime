@@ -94,7 +94,7 @@ The runtime reads these annotations on every managed CR (all in
 | `krateo.io/deletion-policy: orphan\|delete` | on CR delete, leave or delete the external resource (default: delete) |
 | `krateo.io/management-policy: default\|observe\|observe-create-update\|observe-delete` | restrict which phases may act (below) |
 | `krateo.io/external-name` | name of the resource on the external system |
-| `krateo.io/external-create-pending\|-succeeded\|-failed` | the create handshake — **managed by the runtime**; deleting `-pending` by hand queues a fresh Create (recovery lever) |
+| `krateo.io/external-create-pending\|-succeeded\|-failed` | the create handshake — **managed by the runtime**; deleting `-pending` by hand queues a fresh Create (recovery lever). Values are RFC3339 in **UTC**, second precision (since v1.28.2; earlier versions wrote the process's local offset). **Compare parsed times, never strings**: an older value may carry an offset |
 | `krateo.io/traceparent`, `krateo.io/tracestate` | W3C trace context continued across the composition tree |
 
 ### What each management policy does
