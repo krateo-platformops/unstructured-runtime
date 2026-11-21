@@ -926,8 +926,19 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 	// resource whose policy forbids it. A withheld verb is dispatched as Observe instead, and
 	// handleObserve applies the policy's outcome (an error for observe-only on an absent resource,
 	// success otherwise), so there is one place that decides it.
-	if d := meta.ManagementDecision(el); (evt.EventType == ctrlevent.Create && !d.May(managementpolicy.Create)) || (evt.EventType == ctrlevent.Update && !d.May(managementpolicy.Update)) {
-		lg.Debug("Dispatching as Observe: the management policy does not allow this verb",
+	//
+	// An Update is also dispatched as Observe when the policy withholds CREATE and nothing has shown
+	// the resource exists (evt.ObservedExisting unset). Verb sets made "update but not create"
+	// reachable (#110 D1, e.g. "observe,update"), and an informer Update went straight to the
+	// handler even when the resource was absent, where an upsert creates it. handleObserve then
+	// either finds it absent (create withheld: nothing written) or finds drift and queues an Update
+	// marked ObservedExisting, which runs. Measured before this: under "observe,update" an Update
+	// event on an absent resource called the handler's Update once (provider-runtime found the same
+	// shape on its side, provider-runtime#115).
+	if d := meta.ManagementDecision(el); (evt.EventType == ctrlevent.Create && !d.May(managementpolicy.Create)) ||
+		(evt.EventType == ctrlevent.Update && !d.May(managementpolicy.Update)) ||
+		(evt.EventType == ctrlevent.Update && !d.May(managementpolicy.Create) && !evt.ObservedExisting) {
+		lg.Debug("Dispatching as Observe: the management policy does not allow this verb, or withholds create and the resource has not been observed to exist",
 			"verb", evt.EventType, "policy", el.GetAnnotations()[meta.AnnotationKeyManagementPolicy])
 		evt.EventType = ctrlevent.Observe
 	}
@@ -1349,7 +1360,8 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 	} else if observation.ResourceExists && !observation.ResourceUpToDate && !updateWithheld {
 		persistHandlerConditions()
 		item := ctrlevent.Event{
-			EventType: ctrlevent.Update,
+			EventType:        ctrlevent.Update,
+			ObservedExisting: true, // handleObserve saw the resource exist and drift
 			ObjectRef: objectref.ObjectRef{
 				APIVersion: el.GetAPIVersion(),
 				Kind:       el.GetKind(),
