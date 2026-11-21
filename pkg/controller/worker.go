@@ -16,6 +16,7 @@ import (
 	"github.com/krateo-platformops/unstructured-runtime/pkg/controller/objectref"
 	"github.com/krateo-platformops/unstructured-runtime/pkg/controller/priorityqueue"
 	"github.com/krateo-platformops/unstructured-runtime/pkg/errors"
+	"github.com/krateo-platformops/unstructured-runtime/pkg/logging"
 	"github.com/krateo-platformops/unstructured-runtime/pkg/meta"
 	"github.com/krateo-platformops/unstructured-runtime/pkg/telemetry"
 	"github.com/krateo-platformops/unstructured-runtime/pkg/tools"
@@ -44,8 +45,12 @@ const (
 	// filtering events needs to tell "transient, wait" from "needs a human", and both arrive on the
 	// same object from the same branch.
 	reasonCreateOutcomePending event.Reason = "CreateOutcomePending"
-	reasonCannotResolveRefs    event.Reason = "CannotResolveResourceReferences"
-	reasonCannotObserve        event.Reason = "CannotObserveExternalResource"
+	// reasonKeptExistenceUnanswerable (#119): an object being deleted whose existence check the handler
+	// declared permanently unanswerable had its finalizer released WITHOUT a Delete; the external
+	// resource, if any, is kept. An event and not a condition: the object is going away with it.
+	reasonKeptExistenceUnanswerable event.Reason = "ExternalResourceKeptExistenceUnanswerable"
+	reasonCannotResolveRefs         event.Reason = "CannotResolveResourceReferences"
+	reasonCannotObserve             event.Reason = "CannotObserveExternalResource"
 	// reasonAbsentUnderPolicy is the management policy `observe` meeting an absent external resource
 	// (#110). It is NOT reasonCannotObserve: that reason is the generic observe ERROR (a transport
 	// failure, a 5xx, a handler's "created but no identifier recorded, it may exist unreferenced"),
@@ -104,6 +109,12 @@ const (
 	// reconciler that will create it again. For a refusal the handler has declared transient, the
 	// correct instruction is to do nothing. Deliberately names no annotation and asks for no action.
 	errCreatePendingUndetermined = "a create is pending: its outcome could not be determined on this pass and is checked again; reconciliation and deletion wait until it is known"
+	// errCreateUnanswerable is errCreateIncomplete for a check the handler has declared can NEVER answer
+	// (#119). "Clearing by itself" would be false here, so it says so, and names the two ways out
+	// instead. Removing the annotation is the destructive one, so it comes with its precondition.
+	errCreateUnanswerable = "cannot determine creation result, and never will: the existence check can never answer for this object, so reconciliation waits; " +
+		"to recover, verify by hand whether the external resource exists and then remove the " + meta.AnnotationKeyExternalCreatePending +
+		" annotation, or delete this object (the external resource is then kept, not deleted)"
 	errReconcileConnect          = "connect failed"
 	errReconcileObserve          = "observe failed"
 	errReconcileCreate           = "create failed"
@@ -780,6 +791,47 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 					return perr
 				}
 				return wrapped
+			}
+			// PERMANENTLY UNANSWERABLE (#119, Diego 2026-11-21). The handler has declared that this
+			// object's existence can never be checked (ExistenceUnanswerable). Two outcomes, by whether
+			// the object is being deleted:
+			//
+			//   deleting: release the finalizer WITHOUT calling the handler's Delete. The external
+			//   resource, if the create committed, could not be addressed for a Delete anyway, so it is
+			//   kept and the event says so. This is what deletion-policy: orphan already produces; the
+			//   difference is that nobody has to know to annotate first. Before, `kubectl delete` hung
+			//   here for ever.
+			//
+			//   not deleting: stay stopped, exactly as for any unanswered check: the marker is kept and
+			//   no create is retried, so no duplicate can be made. Only the message changes, because
+			//   errCreateIncomplete's "clearing by itself" would be false.
+			//
+			// A transient or unmarked error does not reach here (Undetermined returns above) or keeps
+			// the errCreateIncomplete path below: both wait.
+			if IsExistenceUnanswerable(obsErr) {
+				if meta.WasDeleted(el) {
+					return c.releaseUnanswerableOnDelete(ctx, el, obsErr, lg)
+				}
+				wrapped := fmt.Errorf("%s: %w", errCreateUnanswerable, obsErr)
+				lg.Warn(errCreateUnanswerable, "error", obsErr.Error())
+				c.recordEvent(el, event.Warning(reasonCannotInitialize, actionProcessEvent, wrapped))
+				if cerr := setConditions(el,
+					condition.CreateOutcomeUnknown(wrapped.Error()),
+					condition.ReconcileError(wrapped),
+				); cerr != nil {
+					lg.Error(cerr, "Cannot set condition")
+					c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, cerr))
+					return cerr
+				}
+				if _, perr := tools.PatchStatusConditions(ctx, el, tools.UpdateOptions{
+					Pluralizer:    c.pluralizer,
+					DynamicClient: c.dynamicClient,
+				}); perr != nil {
+					lg.Error(perr, "Cannot update status")
+					c.recordEvent(el, event.Warning(reasonCannotUpdateManaged, actionUpdateManagedResource, perr))
+					return perr
+				}
+				return nil
 			}
 			wrapped := fmt.Errorf("%s: %w", errCreateIncomplete, obsErr)
 			lg.Warn(errCreateIncomplete, "error", obsErr.Error())
@@ -2002,3 +2054,28 @@ type requeueAfter struct {
 }
 
 func (r *requeueAfter) Error() string { return fmt.Sprintf("requeue after %s", r.after) }
+
+// releaseUnanswerableOnDelete removes this controller's finalizer from an object being deleted whose
+// existence check is permanently unanswerable (#119), without calling the handler's Delete, and records
+// that the external resource was kept. See the gate in processItem for why.
+func (c *Controller) releaseUnanswerableOnDelete(ctx context.Context, el *unstructured.Unstructured, cause error, lg logging.Logger) error {
+	msg := fmt.Errorf("%s %s/%s is being deleted and its external resource's existence can never be checked, so its finalizer is released without a delete and the external resource, if one was created, is kept: %w",
+		el.GetKind(), el.GetNamespace(), el.GetName(), cause)
+	if slices.Contains(el.GetFinalizers(), finalizerName) {
+		meta.RemoveFinalizer(el, finalizerName)
+		updated, err := tools.Update(ctx, el, tools.UpdateOptions{
+			Pluralizer:    c.pluralizer,
+			DynamicClient: c.dynamicClient,
+		})
+		if err != nil {
+			lg.Error(err, "Cannot remove finalizer")
+			c.recordEvent(el, event.Warning(reasonCannotUpdateManaged, actionUpdateManagedResource, err))
+			return err
+		}
+		el = updated
+		tracePassFrom(ctx).forget() // the finalizer is gone, and the memo entry with it (#77)
+	}
+	lg.Warn("Existence can never be checked for an object being deleted; finalizer released, external resource kept", "error", cause.Error())
+	c.recordEvent(el, event.Warning(reasonKeptExistenceUnanswerable, actionDeleteExternalResource, msg))
+	return nil
+}
