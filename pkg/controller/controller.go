@@ -91,12 +91,19 @@ type CreateResult struct {
 	Requested bool
 	// Reason says why nothing was requested, when Requested is false. It is logged.
 	Reason string
-	// Conditions the client wants recorded for this create, applied on a nil error exactly as
-	// ExternalObservation.Conditions are on Observe (core-provider#241): upserted by Type before the
-	// runtime's status write. The runtime then stamps its default Synced=ReconcileSuccess ONLY when
-	// they carry no Synced. A refusal that will not resolve without a person (no create verb, a
-	// credential that may not create) can say so, e.g. Ready=False and Synced=False with its own
-	// reason. A wait (an async create, a referent not yet present) can leave Synced to the default.
+	// Conditions the client wants recorded for this create.
+	//
+	// On a nil error they are applied exactly as ExternalObservation.Conditions are on Observe
+	// (core-provider#241): upserted by Type before the runtime's status write, and the runtime stamps
+	// its default Synced=ReconcileSuccess ONLY when they carry no Synced. A refusal that will not
+	// resolve without a person (no create verb, a credential that may not create) can say so, e.g.
+	// Ready=False and Synced=False with its own reason. A wait (an async create, a referent not yet
+	// present) can leave Synced to the default.
+	//
+	// On a non-nil error (since v1.32.1) they are applied too, after the runtime's
+	// Ready=Creating/Synced=ReconcileError, so a Ready the client returns replaces Creating, e.g. a
+	// create the vendor keeps refusing. Their Synced, if any, is IGNORED on that path: the pass
+	// failed, so Synced stays ReconcileError.
 	// Return them, don't write them: a status write from inside the call leaves the runtime's copy
 	// at a stale resourceVersion (core-provider#258). Nil and empty are equivalent.
 	Conditions []metav1.Condition
