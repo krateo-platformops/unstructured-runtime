@@ -2,6 +2,7 @@ package condition
 
 import (
 	"fmt"
+	"github.com/krateo-platformops/plumbing/managementpolicy"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"time"
 )
@@ -356,6 +357,31 @@ func ReconcileError(err error) metav1.Condition {
 		LastTransitionTime: metav1.Now(),
 		Reason:             ReasonReconcileError,
 		Message:            err.Error(),
+	}
+}
+
+// ManagementPolicyInvalid is Synced=False for an object whose krateo.io/management-policy does not
+// parse (#110, D2): the runtime acts on nothing for it (observe only), and message names the value.
+// The reason literal is plumbing managementpolicy's, shared with provider-runtime.
+func ManagementPolicyInvalid(message string) metav1.Condition {
+	return metav1.Condition{
+		Type:               TypeSynced,
+		Status:             metav1.ConditionFalse,
+		LastTransitionTime: metav1.Now(),
+		Reason:             managementpolicy.ReasonInvalid,
+		Message:            message,
+	}
+}
+
+// DeletionPolicyInvalid is Synced=False for an object whose krateo.io/deletion-policy is neither
+// delete nor orphan: the external resource is kept on delete, and message names the value.
+func DeletionPolicyInvalid(message string) metav1.Condition {
+	return metav1.Condition{
+		Type:               TypeSynced,
+		Status:             metav1.ConditionFalse,
+		LastTransitionTime: metav1.Now(),
+		Reason:             managementpolicy.ReasonDeletionPolicyInvalid,
+		Message:            message,
 	}
 }
 

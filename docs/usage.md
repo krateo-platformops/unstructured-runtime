@@ -123,10 +123,21 @@ A withheld verb is withheld whichever way it arrives: from the observe pass, fro
 dispatched as Observe instead.
 
 A value that does not parse (an unknown verb such as `observe-create` or `creat`, or a stray comma)
-**acts on nothing** (D2): it is treated as `observe`, so an absent resource reads
-`Synced=False/ReconcileError` with the `ExternalResourceAbsentUnderPolicy` event, and nothing is
-created, updated or deleted. A typo meant to restrict never widens into full management. A
-dedicated `ManagementPolicyInvalid` reason that names the bad value is a later #110 step.
+**acts on nothing** (D2): it is treated as `observe`, so nothing is created, updated or deleted. A
+typo meant to restrict never widens into full management. It is **reported** as
+`Synced=False/ManagementPolicyInvalid`, whose message names the annotation and the bad token, on
+every pass (since v1.31.0; before, an absent resource read `Synced=False/ReconcileError`).
+
+An unrecognised `krateo.io/deletion-policy` (`orphaned`, `Orphan`, ...) **keeps** the external
+resource on delete, and is reported as `Synced=False/DeletionPolicyInvalid` on **every** pass while it
+is set, not only while deleting, so the typo shows before the delete it decides (Diego, 2026-11-21).
+
+**Synced precedence** (Diego, 2026-11-21): `ManagementPolicyInvalid` replaces whatever the pass
+concluded (`ReconcileSuccess` or `ReconcileError`); otherwise `DeletionPolicyInvalid` does; when both
+are invalid the `ManagementPolicyInvalid` message also names the deletion-policy problem. The pass's
+own error is still returned (same backoff) and its events still fire, e.g.
+`ExternalResourceAbsentUnderPolicy`. `ReconcilePaused` and `ReconcileDeferred` keep their reasons: no
+pass ran. Both reason literals are plumbing `managementpolicy`'s, shared with provider-runtime.
 
 **Deleting an object whose external resource is already absent** still calls the handler's
 `Delete` whenever the policy allows delete (the `deleting-absent` rows of the table), so the

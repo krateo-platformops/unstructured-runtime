@@ -597,7 +597,7 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 		// merely not converging. Flipping it to False would make a deliberate pause look like an
 		// outage and could stall every dependent — that is the verdict change #241 leaves open, and
 		// it is not this.
-		err = unstructuredtools.SetConditions(el, condition.ReconcilePaused(), condition.ReadyPaused())
+		err = setConditions(el, condition.ReconcilePaused(), condition.ReadyPaused())
 		if err != nil {
 			log.Error(err, "Cannot set condition")
 			c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))
@@ -763,7 +763,7 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 					"requeueing rather than reporting an unknown create outcome", "error", obsErr.Error())
 				c.recordEvent(el, event.Warning(reasonCreateOutcomePending, actionProcessEvent, wrapped))
 
-				if cerr := unstructuredtools.SetConditions(el,
+				if cerr := setConditions(el,
 					condition.Creating(),
 					condition.ReconcileError(wrapped),
 				); cerr != nil {
@@ -785,7 +785,7 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 			lg.Warn(errCreateIncomplete, "error", obsErr.Error())
 			c.recordEvent(el, event.Warning(reasonCannotInitialize, actionProcessEvent, wrapped))
 
-			err = unstructuredtools.SetConditions(el,
+			err = setConditions(el,
 				// #93: its own reason, carrying the cause and the remediation. A bare Creating read
 				// like a healthy create in progress, while this refusal lasts until the existence
 				// check succeeds or a human clears the marker.
@@ -1057,7 +1057,7 @@ func (c *Controller) deferPass(ctx context.Context, el *unstructured.Unstructure
 		return &ratelimit.DeferredError{Deferral: d, After: after}
 	}
 
-	if err := unstructuredtools.SetConditions(el, cond); err != nil {
+	if err := setConditions(el, cond); err != nil {
 		log.Error(err, "Cannot set the deferral condition")
 		c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))
 		return err
@@ -1194,7 +1194,7 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 		switch {
 		case IsReadyAssessed(actionErr):
 			// The handler owns Ready for this call. Write only Synced.
-			err = unstructuredtools.SetConditions(e, condition.ReconcileError(wrapped))
+			err = setConditions(e, condition.ReconcileError(wrapped))
 		default:
 			// ONE DELETION DECISION PER PASS (#47/#48), made STICKY (#46). Two fixes to the same
 			// defect, combined rather than chosen between:
@@ -1220,7 +1220,7 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 			if deleting {
 				readyCond = condition.Deleting()
 			}
-			err = unstructuredtools.SetConditions(e, readyCond, condition.ReconcileError(wrapped))
+			err = setConditions(e, readyCond, condition.ReconcileError(wrapped))
 		}
 		if err != nil {
 			log.Error(err, "Cannot set condition")
@@ -1258,7 +1258,7 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 	// recorded must not turn a successful observe into an error, which is the shape that wedges a
 	// resource.
 	if len(observation.Conditions) > 0 {
-		if cerr := unstructuredtools.SetConditions(el, observation.Conditions...); cerr != nil {
+		if cerr := setConditions(el, observation.Conditions...); cerr != nil {
 			log.Error(cerr, "Cannot set conditions returned by the external client")
 			c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, cerr))
 		}
@@ -1316,7 +1316,7 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 		persistHandlerConditions()
 		passErr := errors.Wrap(errors.New(errExternalResourceNotExist), errReconcileObserve)
 		c.recordEvent(el, event.Warning(reasonAbsentUnderPolicy, actionObserveExternalResource, passErr))
-		if err := unstructuredtools.SetConditions(el, condition.ReconcileError(passErr)); err != nil {
+		if err := setConditions(el, condition.ReconcileError(passErr)); err != nil {
 			log.Error(err, "Cannot set condition")
 			c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))
 			return err
@@ -1375,7 +1375,7 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 		// statement about its own convergence, and the specific statement wins. The runtime's
 		// default is a default, not an override.
 		if !hasConditionType(observation.Conditions, condition.TypeSynced) {
-			err = unstructuredtools.SetConditions(el, condition.ReconcileSuccess())
+			err = setConditions(el, condition.ReconcileSuccess())
 			if err != nil {
 				log.Error(err, "Cannot set condition")
 				c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))
@@ -1439,7 +1439,7 @@ func (c *Controller) handleCreate(ctx context.Context, ref objectref.ObjectRef) 
 		}
 		// ONE error value for BOTH conditions, so Ready's message and Synced's cannot diverge.
 		wrapped := errors.Wrap(uerr, errUpdateManaged)
-		err = unstructuredtools.SetConditions(el,
+		err = setConditions(el,
 			condition.WithMessage(condition.Creating(), wrapped.Error()),
 			condition.ReconcileError(wrapped))
 		if err != nil {
@@ -1528,7 +1528,7 @@ func (c *Controller) handleCreate(ctx context.Context, ref objectref.ObjectRef) 
 		// Ready=False/Creating with an EMPTY message beside a complete Synced message, on a
 		// create that retried forever.
 		wrapped := errors.Wrap(actionErr, errReconcileCreate)
-		err = unstructuredtools.SetConditions(el,
+		err = setConditions(el,
 			condition.WithMessage(condition.Creating(), wrapped.Error()),
 			condition.ReconcileError(wrapped))
 		if err != nil {
@@ -1573,7 +1573,7 @@ func (c *Controller) handleCreate(ctx context.Context, ref objectref.ObjectRef) 
 			return err
 		}
 		wrapped := errors.Wrap(uerr, errUpdateManagedAnnotations)
-		err = unstructuredtools.SetConditions(el,
+		err = setConditions(el,
 			condition.WithMessage(condition.Creating(), wrapped.Error()),
 			condition.ReconcileError(wrapped))
 		if err != nil {
@@ -1711,7 +1711,7 @@ func (c *Controller) handleUpdate(ctx context.Context, ref objectref.ObjectRef) 
 			return err
 		}
 
-		err = unstructuredtools.SetConditions(e, condition.ReconcileError(errors.Wrap(actionErr, errReconcileUpdate)))
+		err = setConditions(e, condition.ReconcileError(errors.Wrap(actionErr, errReconcileUpdate)))
 		if err != nil {
 			log.Error(err, "Cannot set condition")
 			c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))
@@ -1737,7 +1737,7 @@ func (c *Controller) handleUpdate(ctx context.Context, ref objectref.ObjectRef) 
 		return err
 	}
 
-	err = unstructuredtools.SetConditions(el, condition.ReconcileSuccess())
+	err = setConditions(el, condition.ReconcileSuccess())
 	if err != nil {
 		log.Error(err, "Cannot set conditions")
 		c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))
@@ -1795,7 +1795,7 @@ func (c *Controller) handleDelete(ctx context.Context, ref objectref.ObjectRef) 
 		c.recordEvent(el, event.Warning(reasonCannotDelete, actionDeleteExternalResource, actionErr))
 
 		wrapped := errors.Wrap(actionErr, errReconcileDelete)
-		err := unstructuredtools.SetConditions(el,
+		err := setConditions(el,
 			condition.WithMessage(condition.Deleting(), wrapped.Error()),
 			condition.ReconcileError(wrapped))
 		if err != nil {
@@ -1821,7 +1821,7 @@ func (c *Controller) handleDelete(ctx context.Context, ref objectref.ObjectRef) 
 		return err
 	}
 
-	err = unstructuredtools.SetConditions(el, condition.Deleting(), condition.ReconcileSuccess())
+	err = setConditions(el, condition.Deleting(), condition.ReconcileSuccess())
 	if err != nil {
 		log.Error(err, "Cannot set conditions")
 		c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))
@@ -1935,14 +1935,14 @@ func (c *Controller) recordEvent(obj runtime.Object, e event.Event) {
 // its own convergence is more specific than the runtime's default.
 func setCreateConditions(el *unstructured.Unstructured, conds []metav1.Condition) error {
 	if len(conds) > 0 {
-		if err := unstructuredtools.SetConditions(el, conds...); err != nil {
+		if err := setConditions(el, conds...); err != nil {
 			return err
 		}
 	}
 	if hasConditionType(conds, condition.TypeSynced) {
 		return nil
 	}
-	return unstructuredtools.SetConditions(el, condition.ReconcileSuccess())
+	return setConditions(el, condition.ReconcileSuccess())
 }
 
 // hasConditionType reports whether conds contains a condition of type t.
