@@ -35,8 +35,11 @@ var updatePolicyTable = flag.Bool("update-policy-table", false, "rewrite testdat
 // The table describes what the code DOES; it asserts nothing about what it should do. That is D4's
 // decision, taken against it. Regenerate with -update-policy-table and review the diff.
 func TestManagementPolicyTable(t *testing.T) {
-	policies := []string{"", meta.ManagementPolicyDefault, meta.ManagementPolicyObserveCreateUpdate, meta.ManagementPolicyObserveDelete, meta.ManagementPolicyObserve, "observe-create"}
-	deletions := []string{"", meta.DeletionPolicyDelete, meta.DeletionPolicyOrphan}
+	// The last two policies are #110 D1/D3 inputs (a verb set; observe implied), "observe-create" is
+	// the D2 invalid value, and "orphaned" an unrecognised deletion policy, which keeps (Diego,
+	// 2026-11-19). provider-runtime's table uses the same lists, in the same order.
+	policies := []string{"", meta.ManagementPolicyDefault, meta.ManagementPolicyObserveCreateUpdate, meta.ManagementPolicyObserveDelete, meta.ManagementPolicyObserve, "observe-create", "observe,create", "create"}
+	deletions := []string{"", meta.DeletionPolicyDelete, meta.DeletionPolicyOrphan, "orphaned"}
 	states := []struct {
 		name     string
 		obs      ExternalObservation
@@ -81,9 +84,9 @@ func TestManagementPolicyTable(t *testing.T) {
 	want, err := os.ReadFile(golden)
 	require.NoError(t, err, "no golden table: run with -update-policy-table and review it")
 	require.Equal(t, string(want), b.String(), "the measured table changed; if intended, re-run with -update-policy-table and review the diff")
-	// 6 × 3 × 5 rows plus the header: a table that silently lost rows would also pass a diff
+	// 8 × 4 × 5 rows plus the header: a table that silently lost rows would also pass a diff
 	// against an equally short golden file.
-	require.Equal(t, 1+6*3*5, strings.Count(b.String(), "\n"))
+	require.Equal(t, 1+8*4*5, strings.Count(b.String(), "\n"))
 }
 
 // tsvCell keeps one cell on one line and tab-free.

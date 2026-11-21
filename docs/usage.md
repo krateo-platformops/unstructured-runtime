@@ -85,14 +85,14 @@ recorders, pluralizer, no-op logger, disabled metrics server); every knob is a
 
 ## Operating a resource under this runtime
 
-The runtime reads these annotations on every managed CR (all in
-`pkg/meta/meta.go`):
+The runtime reads these annotations on every managed CR (`pkg/meta/meta.go`; the two policy
+annotations are defined by plumbing's `managementpolicy` package, shared with provider-runtime):
 
 | Annotation | Meaning |
 |---|---|
 | `krateo.io/paused: "true"` | pause reconciliation (condition `ReconcilePaused`); remove to resume |
-| `krateo.io/deletion-policy: orphan\|delete` | on CR delete, leave or delete the external resource (default: delete) |
-| `krateo.io/management-policy: default\|observe\|observe-create-update\|observe-delete` | restrict which phases may act (below) |
+| `krateo.io/deletion-policy: orphan\|delete` | on CR delete, leave or delete the external resource (default: delete). Any other value (`orphaned`, `Orphan`, ...) **keeps** it |
+| `krateo.io/management-policy` | the verbs the runtime may perform: a comma-separated set such as `observe,create`, or one of `default`, `observe`, `observe-create-update`, `observe-delete` (below) |
 | `krateo.io/external-name` | name of the resource on the external system |
 | `krateo.io/external-create-pending\|-succeeded\|-failed` | the create handshake — **managed by the runtime**; deleting `-pending` by hand queues a fresh Create (recovery lever). Values are RFC3339 in **UTC**, second precision (since v1.28.2; earlier versions wrote the process's local offset). **Compare parsed times, never strings**: an older value may carry an offset, and markers already on an object are never rewritten, so across an upgrade from v1.28.1 or earlier one object can hold a pending marker at `+01:00` beside a clearer at `Z`, the very pair a string compare misorders |
 | `krateo.io/traceparent`, `krateo.io/tracestate` | W3C trace context continued across the composition tree |
@@ -104,17 +104,35 @@ delete honoured it: a resource annotated `observe` was still created and updated
 mirror provider-runtime's managed reconciler and are pinned by `pkg/controller/testdata/management-policy-table.tsv`
 (policy × deletion policy × state):
 
+Since #110 D1 the value is a **set of verbs**, comma-separated, in any order, from `observe`,
+`create`, `update`, `delete`: `observe,create` means "observe and create, never update or
+delete". `observe` is always implied (D3), so `create` means `observe,create`. The four historical
+values are aliases for their sets: `default` = all four, `observe-create-update`, `observe-delete`,
+`observe`.
+
 | policy | absent | drifted | on CR delete |
 |---|---|---|---|
 | `default` (or unset) | create | update | delete, or orphan with `deletion-policy: orphan` |
 | `observe-create-update` | create | update | orphan |
-| `observe-delete` | nothing, `Synced=True` | nothing, `Synced=True` | delete |
+| `observe,create` (or `create`) | create | nothing, `Synced=True` | orphan |
+| `observe-delete` | nothing, `Synced=True` | nothing, `Synced=True` | delete, or orphan with `deletion-policy: orphan` (D5: orphan always wins; before v1.30.0 it deleted anyway) |
 | `observe` | `Synced=False/ReconcileError` "external resource does not exist", `ExternalResourceAbsentUnderPolicy` event (v1.28.1; v1.28.0 used `CannotObserveExternalResource`, the generic observe-error reason) | nothing, `Synced=True` | orphan |
 
 A withheld verb is withheld whichever way it arrives: from the observe pass, from a CR update
 (dispatched as `Update` by default), or from removing `krateo.io/external-create-pending`. It is
-dispatched as Observe instead. An unknown value currently acts like `observe-delete` minus the
-delete: no create, no update, orphan on delete. #110 (D2) makes it an explicit refusal.
+dispatched as Observe instead.
+
+A value that does not parse (an unknown verb such as `observe-create` or `creat`, or a stray comma)
+**acts on nothing** (D2): it is treated as `observe`, so an absent resource reads
+`Synced=False/ReconcileError` with the `ExternalResourceAbsentUnderPolicy` event, and nothing is
+created, updated or deleted. A typo meant to restrict never widens into full management. A
+dedicated `ManagementPolicyInvalid` reason that names the bad value is a later #110 step.
+
+**Deleting an object whose external resource is already absent** still calls the handler's
+`Delete` whenever the policy allows delete (the `deleting-absent` rows of the table), so the
+handler, which alone can tell "verified gone" from "could not determine", decides when the
+finalizer goes. This is unstructured-runtime's contract (Diego, 2026-11-21, #110); provider-runtime
+instead removes the finalizer without a `Delete`.
 
 ## Who consumes it
 
