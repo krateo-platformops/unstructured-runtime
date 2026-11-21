@@ -188,6 +188,9 @@ func TestHandleCreate_FailedCreate_ClientConditionsApplied_SyncedStaysTheRuntime
 	refused := []metav1.Condition{
 		{Type: condition.TypeReady, Status: metav1.ConditionFalse, Reason: "CreateRefusedPersistently", Message: "the vendor has refused this create for 1h", LastTransitionTime: metav1.Now()},
 		{Type: condition.TypeSynced, Status: metav1.ConditionTrue, Reason: "HandlerSaysFine", LastTransitionTime: metav1.Now()},
+		// A type the runtime does not write on this path is ADDED, not dropped (oasgen-provider routes
+		// several reports through here).
+		{Type: "ResolverDigestRecorded", Status: metav1.ConditionTrue, Reason: "Recorded", LastTransitionTime: metav1.Now()},
 	}
 	pass := runCreate(t, "failed-with-conds", func(o Options) ExternalClient {
 		return &resultCreator{t: t, dyn: o.Client, gvr: o.GVR, result: CreateResult{Requested: true, Conditions: refused}, err: errors.New("409 from the vendor")}
@@ -200,6 +203,9 @@ func TestHandleCreate_FailedCreate_ClientConditionsApplied_SyncedStaysTheRuntime
 	require.NotNil(t, synced)
 	require.Equal(t, metav1.ConditionFalse, synced.Status)
 	require.Equal(t, condition.ReasonReconcileError, synced.Reason, "a failed pass keeps the runtime's Synced, not the client's")
+	extra := conditionOf(t, pass.obj, "ResolverDigestRecorded")
+	require.NotNil(t, extra, "a client condition of a type the runtime does not write must be added")
+	require.Equal(t, "Recorded", extra.Reason)
 
 	control := runCreate(t, "failed-no-conds", func(o Options) ExternalClient {
 		return &resultCreator{t: t, dyn: o.Client, gvr: o.GVR, result: CreateResult{Requested: true}, err: errors.New("409 from the vendor")}
