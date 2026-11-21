@@ -179,3 +179,31 @@ func TestHandleCreate_Requested_ClientConditionsApplied(t *testing.T) {
 	require.Equal(t, "AsyncCreateAccepted", c.Reason)
 	require.Contains(t, pass.obj.GetAnnotations(), meta.AnnotationKeyExternalCreateSucceeded)
 }
+
+// A FAILED create's own conditions are written (oasgen-provider: a create the vendor has refused for an
+// hour, Ready=False/CreateRefusedPersistently, never reached the apiserver because this path returned
+// before applying them). Its Ready replaces the runtime's Creating; its Synced is ignored, so Synced stays
+// ReconcileError. CONTROL: a failed create that returns no conditions keeps Ready=Creating.
+func TestHandleCreate_FailedCreate_ClientConditionsApplied_SyncedStaysTheRuntimes(t *testing.T) {
+	refused := []metav1.Condition{
+		{Type: condition.TypeReady, Status: metav1.ConditionFalse, Reason: "CreateRefusedPersistently", Message: "the vendor has refused this create for 1h", LastTransitionTime: metav1.Now()},
+		{Type: condition.TypeSynced, Status: metav1.ConditionTrue, Reason: "HandlerSaysFine", LastTransitionTime: metav1.Now()},
+	}
+	pass := runCreate(t, "failed-with-conds", func(o Options) ExternalClient {
+		return &resultCreator{t: t, dyn: o.Client, gvr: o.GVR, result: CreateResult{Requested: true, Conditions: refused}, err: errors.New("409 from the vendor")}
+	})
+	require.Error(t, pass.err, "premise: the create failed")
+	ready := conditionOf(t, pass.obj, condition.TypeReady)
+	require.NotNil(t, ready)
+	require.Equal(t, "CreateRefusedPersistently", ready.Reason, "the client's Ready must reach the apiserver on a failed create")
+	synced := conditionOf(t, pass.obj, condition.TypeSynced)
+	require.NotNil(t, synced)
+	require.Equal(t, metav1.ConditionFalse, synced.Status)
+	require.Equal(t, condition.ReasonReconcileError, synced.Reason, "a failed pass keeps the runtime's Synced, not the client's")
+
+	control := runCreate(t, "failed-no-conds", func(o Options) ExternalClient {
+		return &resultCreator{t: t, dyn: o.Client, gvr: o.GVR, result: CreateResult{Requested: true}, err: errors.New("409 from the vendor")}
+	})
+	require.Error(t, control.err)
+	require.Equal(t, condition.ReasonCreating, conditionOf(t, control.obj, condition.TypeReady).Reason, "control: no client conditions, Ready stays Creating")
+}

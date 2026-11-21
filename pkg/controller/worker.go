@@ -1600,6 +1600,19 @@ func (c *Controller) handleCreate(ctx context.Context, ref objectref.ObjectRef) 
 			c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))
 			return err
 		}
+		// A FAILED create's own conditions (CreateResult.Conditions), upserted by Type onto the
+		// RE-FETCHED object that is written, AFTER the runtime's Creating/ReconcileError: so a
+		// handler's Ready (e.g. a create the vendor has refused for an hour) replaces Creating. These
+		// used to be dropped on this path, since both setCreateConditions sites are past the return
+		// below. A handler's Synced is NOT applied here: the pass failed, so Synced stays the
+		// runtime's ReconcileError, and a handler-chosen Synced would also slip past the #117
+		// precedence funnel (which rewrites only ReconcileSuccess/ReconcileError), hiding
+		// DeletionPolicyInvalid, which can coexist with a create.
+		if err := setFailedCreateConditions(el, created.Conditions); err != nil {
+			log.Error(err, "Cannot set conditions")
+			c.recordEvent(el, event.Warning(reasonCannotSetConditions, actionUpdateManagedResource, err))
+			return err
+		}
 		el, err = tools.PatchStatusConditions(ctx, el, tools.UpdateOptions{
 			Pluralizer:    c.pluralizer,
 			DynamicClient: c.dynamicClient,
@@ -2000,6 +2013,21 @@ func (c *Controller) recordEvent(obj runtime.Object, e event.Event) {
 // Conditions, upserted by Type), then the runtime's default Synced=ReconcileSuccess only when the
 // client gave no Synced. The same rule as Observe's (core-provider#241): the client's statement about
 // its own convergence is more specific than the runtime's default.
+// setFailedCreateConditions applies a failed create's own conditions, every type but Synced (see the
+// call site).
+func setFailedCreateConditions(el *unstructured.Unstructured, conds []metav1.Condition) error {
+	var keep []metav1.Condition
+	for _, c := range conds {
+		if c.Type != condition.TypeSynced {
+			keep = append(keep, c)
+		}
+	}
+	if len(keep) == 0 {
+		return nil
+	}
+	return setConditions(el, keep...)
+}
+
 func setCreateConditions(el *unstructured.Unstructured, conds []metav1.Condition) error {
 	if len(conds) > 0 {
 		if err := setConditions(el, conds...); err != nil {
