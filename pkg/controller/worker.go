@@ -1901,7 +1901,10 @@ func (c *Controller) handleDelete(ctx context.Context, ref objectref.ObjectRef) 
 		return err
 	}
 
-	el.SetFinalizers([]string{})
+	// #122: remove OUR finalizer only. This used to clear every finalizer ([]string{}), so another
+	// owner's finalizer (or Kubernetes' foregroundDeletion) was stripped and the object deleted
+	// while that owner still held it. The orphan path and the unanswerable-delete path already did this.
+	meta.RemoveFinalizer(el, finalizerName)
 	el, err = tools.Update(ctx, el, tools.UpdateOptions{
 		Pluralizer:    c.pluralizer,
 		DynamicClient: c.dynamicClient,
