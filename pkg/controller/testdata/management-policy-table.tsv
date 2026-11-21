@@ -14,9 +14,9 @@ unset	orphan	up-to-date	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
 unset	orphan	drifted	1	0	1	0	false	-	-	-	True	ReconcileSuccess	-	UpdatedExternalResource	-	resync
 unset	orphan	deleting-present	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
 unset	orphan	deleting-absent	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
-unset	orphaned	absent	1	1	0	0	false	-	-	-	True	ReconcileSuccess	-	CreatedExternalResource	-	resync
-unset	orphaned	up-to-date	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
-unset	orphaned	drifted	1	0	1	0	false	-	-	-	True	ReconcileSuccess	-	UpdatedExternalResource	-	resync
+unset	orphaned	absent	1	1	0	0	false	-	-	-	False	DeletionPolicyInvalid	krateo.io/deletion-policy "orphaned" is not "delete" or "orphan"; the external resource is kept	CreatedExternalResource	-	resync
+unset	orphaned	up-to-date	1	0	0	0	false	-	-	-	False	DeletionPolicyInvalid	krateo.io/deletion-policy "orphaned" is not "delete" or "orphan"; the external resource is kept	-	-	resync
+unset	orphaned	drifted	1	0	1	0	false	-	-	-	False	DeletionPolicyInvalid	krateo.io/deletion-policy "orphaned" is not "delete" or "orphan"; the external resource is kept	UpdatedExternalResource	-	resync
 unset	orphaned	deleting-present	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
 unset	orphaned	deleting-absent	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
 default	unset	absent	1	1	0	0	false	-	-	-	True	ReconcileSuccess	-	CreatedExternalResource	-	resync
@@ -34,9 +34,9 @@ default	orphan	up-to-date	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
 default	orphan	drifted	1	0	1	0	false	-	-	-	True	ReconcileSuccess	-	UpdatedExternalResource	-	resync
 default	orphan	deleting-present	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
 default	orphan	deleting-absent	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
-default	orphaned	absent	1	1	0	0	false	-	-	-	True	ReconcileSuccess	-	CreatedExternalResource	-	resync
-default	orphaned	up-to-date	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
-default	orphaned	drifted	1	0	1	0	false	-	-	-	True	ReconcileSuccess	-	UpdatedExternalResource	-	resync
+default	orphaned	absent	1	1	0	0	false	-	-	-	False	DeletionPolicyInvalid	krateo.io/deletion-policy "orphaned" is not "delete" or "orphan"; the external resource is kept	CreatedExternalResource	-	resync
+default	orphaned	up-to-date	1	0	0	0	false	-	-	-	False	DeletionPolicyInvalid	krateo.io/deletion-policy "orphaned" is not "delete" or "orphan"; the external resource is kept	-	-	resync
+default	orphaned	drifted	1	0	1	0	false	-	-	-	False	DeletionPolicyInvalid	krateo.io/deletion-policy "orphaned" is not "delete" or "orphan"; the external resource is kept	UpdatedExternalResource	-	resync
 default	orphaned	deleting-present	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
 default	orphaned	deleting-absent	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
 observe-create-update	unset	absent	1	1	0	0	false	-	-	-	True	ReconcileSuccess	-	CreatedExternalResource	-	resync
@@ -54,9 +54,9 @@ observe-create-update	orphan	up-to-date	1	0	0	0	false	-	-	-	True	ReconcileSucces
 observe-create-update	orphan	drifted	1	0	1	0	false	-	-	-	True	ReconcileSuccess	-	UpdatedExternalResource	-	resync
 observe-create-update	orphan	deleting-present	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
 observe-create-update	orphan	deleting-absent	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
-observe-create-update	orphaned	absent	1	1	0	0	false	-	-	-	True	ReconcileSuccess	-	CreatedExternalResource	-	resync
-observe-create-update	orphaned	up-to-date	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
-observe-create-update	orphaned	drifted	1	0	1	0	false	-	-	-	True	ReconcileSuccess	-	UpdatedExternalResource	-	resync
+observe-create-update	orphaned	absent	1	1	0	0	false	-	-	-	False	DeletionPolicyInvalid	krateo.io/deletion-policy "orphaned" is not "delete" or "orphan"; the external resource is kept	CreatedExternalResource	-	resync
+observe-create-update	orphaned	up-to-date	1	0	0	0	false	-	-	-	False	DeletionPolicyInvalid	krateo.io/deletion-policy "orphaned" is not "delete" or "orphan"; the external resource is kept	-	-	resync
+observe-create-update	orphaned	drifted	1	0	1	0	false	-	-	-	False	DeletionPolicyInvalid	krateo.io/deletion-policy "orphaned" is not "delete" or "orphan"; the external resource is kept	UpdatedExternalResource	-	resync
 observe-create-update	orphaned	deleting-present	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
 observe-create-update	orphaned	deleting-absent	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
 observe-delete	unset	absent	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
@@ -74,9 +74,9 @@ observe-delete	orphan	up-to-date	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-
 observe-delete	orphan	drifted	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
 observe-delete	orphan	deleting-present	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
 observe-delete	orphan	deleting-absent	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
-observe-delete	orphaned	absent	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
-observe-delete	orphaned	up-to-date	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
-observe-delete	orphaned	drifted	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
+observe-delete	orphaned	absent	1	0	0	0	false	-	-	-	False	DeletionPolicyInvalid	krateo.io/deletion-policy "orphaned" is not "delete" or "orphan"; the external resource is kept	-	-	resync
+observe-delete	orphaned	up-to-date	1	0	0	0	false	-	-	-	False	DeletionPolicyInvalid	krateo.io/deletion-policy "orphaned" is not "delete" or "orphan"; the external resource is kept	-	-	resync
+observe-delete	orphaned	drifted	1	0	0	0	false	-	-	-	False	DeletionPolicyInvalid	krateo.io/deletion-policy "orphaned" is not "delete" or "orphan"; the external resource is kept	-	-	resync
 observe-delete	orphaned	deleting-present	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
 observe-delete	orphaned	deleting-absent	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
 observe	unset	absent	1	0	0	0	false	-	-	-	False	ReconcileError	observe failed: external resource does not exist	ExternalResourceAbsentUnderPolicy	observe failed: external resource does not exist	rate-limited
@@ -94,29 +94,29 @@ observe	orphan	up-to-date	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
 observe	orphan	drifted	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
 observe	orphan	deleting-present	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
 observe	orphan	deleting-absent	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
-observe	orphaned	absent	1	0	0	0	false	-	-	-	False	ReconcileError	observe failed: external resource does not exist	ExternalResourceAbsentUnderPolicy	observe failed: external resource does not exist	rate-limited
-observe	orphaned	up-to-date	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
-observe	orphaned	drifted	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
+observe	orphaned	absent	1	0	0	0	false	-	-	-	False	DeletionPolicyInvalid	krateo.io/deletion-policy "orphaned" is not "delete" or "orphan"; the external resource is kept	ExternalResourceAbsentUnderPolicy	observe failed: external resource does not exist	rate-limited
+observe	orphaned	up-to-date	1	0	0	0	false	-	-	-	False	DeletionPolicyInvalid	krateo.io/deletion-policy "orphaned" is not "delete" or "orphan"; the external resource is kept	-	-	resync
+observe	orphaned	drifted	1	0	0	0	false	-	-	-	False	DeletionPolicyInvalid	krateo.io/deletion-policy "orphaned" is not "delete" or "orphan"; the external resource is kept	-	-	resync
 observe	orphaned	deleting-present	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
 observe	orphaned	deleting-absent	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
-observe-create	unset	absent	1	0	0	0	false	-	-	-	False	ReconcileError	observe failed: external resource does not exist	ExternalResourceAbsentUnderPolicy	observe failed: external resource does not exist	rate-limited
-observe-create	unset	up-to-date	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
-observe-create	unset	drifted	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
+observe-create	unset	absent	1	0	0	0	false	-	-	-	False	ManagementPolicyInvalid	krateo.io/management-policy "observe-create": unknown verb "observe-create" (want a comma-separated set of observe, create, update, delete, or one of default, observe-create-update, observe-delete, observe); acting on nothing (observe only)	ExternalResourceAbsentUnderPolicy	observe failed: external resource does not exist	rate-limited
+observe-create	unset	up-to-date	1	0	0	0	false	-	-	-	False	ManagementPolicyInvalid	krateo.io/management-policy "observe-create": unknown verb "observe-create" (want a comma-separated set of observe, create, update, delete, or one of default, observe-create-update, observe-delete, observe); acting on nothing (observe only)	-	-	resync
+observe-create	unset	drifted	1	0	0	0	false	-	-	-	False	ManagementPolicyInvalid	krateo.io/management-policy "observe-create": unknown verb "observe-create" (want a comma-separated set of observe, create, update, delete, or one of default, observe-create-update, observe-delete, observe); acting on nothing (observe only)	-	-	resync
 observe-create	unset	deleting-present	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
 observe-create	unset	deleting-absent	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
-observe-create	delete	absent	1	0	0	0	false	-	-	-	False	ReconcileError	observe failed: external resource does not exist	ExternalResourceAbsentUnderPolicy	observe failed: external resource does not exist	rate-limited
-observe-create	delete	up-to-date	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
-observe-create	delete	drifted	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
+observe-create	delete	absent	1	0	0	0	false	-	-	-	False	ManagementPolicyInvalid	krateo.io/management-policy "observe-create": unknown verb "observe-create" (want a comma-separated set of observe, create, update, delete, or one of default, observe-create-update, observe-delete, observe); acting on nothing (observe only)	ExternalResourceAbsentUnderPolicy	observe failed: external resource does not exist	rate-limited
+observe-create	delete	up-to-date	1	0	0	0	false	-	-	-	False	ManagementPolicyInvalid	krateo.io/management-policy "observe-create": unknown verb "observe-create" (want a comma-separated set of observe, create, update, delete, or one of default, observe-create-update, observe-delete, observe); acting on nothing (observe only)	-	-	resync
+observe-create	delete	drifted	1	0	0	0	false	-	-	-	False	ManagementPolicyInvalid	krateo.io/management-policy "observe-create": unknown verb "observe-create" (want a comma-separated set of observe, create, update, delete, or one of default, observe-create-update, observe-delete, observe); acting on nothing (observe only)	-	-	resync
 observe-create	delete	deleting-present	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
 observe-create	delete	deleting-absent	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
-observe-create	orphan	absent	1	0	0	0	false	-	-	-	False	ReconcileError	observe failed: external resource does not exist	ExternalResourceAbsentUnderPolicy	observe failed: external resource does not exist	rate-limited
-observe-create	orphan	up-to-date	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
-observe-create	orphan	drifted	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
+observe-create	orphan	absent	1	0	0	0	false	-	-	-	False	ManagementPolicyInvalid	krateo.io/management-policy "observe-create": unknown verb "observe-create" (want a comma-separated set of observe, create, update, delete, or one of default, observe-create-update, observe-delete, observe); acting on nothing (observe only)	ExternalResourceAbsentUnderPolicy	observe failed: external resource does not exist	rate-limited
+observe-create	orphan	up-to-date	1	0	0	0	false	-	-	-	False	ManagementPolicyInvalid	krateo.io/management-policy "observe-create": unknown verb "observe-create" (want a comma-separated set of observe, create, update, delete, or one of default, observe-create-update, observe-delete, observe); acting on nothing (observe only)	-	-	resync
+observe-create	orphan	drifted	1	0	0	0	false	-	-	-	False	ManagementPolicyInvalid	krateo.io/management-policy "observe-create": unknown verb "observe-create" (want a comma-separated set of observe, create, update, delete, or one of default, observe-create-update, observe-delete, observe); acting on nothing (observe only)	-	-	resync
 observe-create	orphan	deleting-present	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
 observe-create	orphan	deleting-absent	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
-observe-create	orphaned	absent	1	0	0	0	false	-	-	-	False	ReconcileError	observe failed: external resource does not exist	ExternalResourceAbsentUnderPolicy	observe failed: external resource does not exist	rate-limited
-observe-create	orphaned	up-to-date	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
-observe-create	orphaned	drifted	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
+observe-create	orphaned	absent	1	0	0	0	false	-	-	-	False	ManagementPolicyInvalid	krateo.io/management-policy "observe-create": unknown verb "observe-create" (want a comma-separated set of observe, create, update, delete, or one of default, observe-create-update, observe-delete, observe); acting on nothing (observe only); also, krateo.io/deletion-policy "orphaned" is not "delete" or "orphan"; the external resource is kept	ExternalResourceAbsentUnderPolicy	observe failed: external resource does not exist	rate-limited
+observe-create	orphaned	up-to-date	1	0	0	0	false	-	-	-	False	ManagementPolicyInvalid	krateo.io/management-policy "observe-create": unknown verb "observe-create" (want a comma-separated set of observe, create, update, delete, or one of default, observe-create-update, observe-delete, observe); acting on nothing (observe only); also, krateo.io/deletion-policy "orphaned" is not "delete" or "orphan"; the external resource is kept	-	-	resync
+observe-create	orphaned	drifted	1	0	0	0	false	-	-	-	False	ManagementPolicyInvalid	krateo.io/management-policy "observe-create": unknown verb "observe-create" (want a comma-separated set of observe, create, update, delete, or one of default, observe-create-update, observe-delete, observe); acting on nothing (observe only); also, krateo.io/deletion-policy "orphaned" is not "delete" or "orphan"; the external resource is kept	-	-	resync
 observe-create	orphaned	deleting-present	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
 observe-create	orphaned	deleting-absent	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
 observe,create	unset	absent	1	1	0	0	false	-	-	-	True	ReconcileSuccess	-	CreatedExternalResource	-	resync
@@ -134,9 +134,9 @@ observe,create	orphan	up-to-date	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-
 observe,create	orphan	drifted	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
 observe,create	orphan	deleting-present	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
 observe,create	orphan	deleting-absent	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
-observe,create	orphaned	absent	1	1	0	0	false	-	-	-	True	ReconcileSuccess	-	CreatedExternalResource	-	resync
-observe,create	orphaned	up-to-date	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
-observe,create	orphaned	drifted	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
+observe,create	orphaned	absent	1	1	0	0	false	-	-	-	False	DeletionPolicyInvalid	krateo.io/deletion-policy "orphaned" is not "delete" or "orphan"; the external resource is kept	CreatedExternalResource	-	resync
+observe,create	orphaned	up-to-date	1	0	0	0	false	-	-	-	False	DeletionPolicyInvalid	krateo.io/deletion-policy "orphaned" is not "delete" or "orphan"; the external resource is kept	-	-	resync
+observe,create	orphaned	drifted	1	0	0	0	false	-	-	-	False	DeletionPolicyInvalid	krateo.io/deletion-policy "orphaned" is not "delete" or "orphan"; the external resource is kept	-	-	resync
 observe,create	orphaned	deleting-present	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
 observe,create	orphaned	deleting-absent	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
 create	unset	absent	1	1	0	0	false	-	-	-	True	ReconcileSuccess	-	CreatedExternalResource	-	resync
@@ -154,8 +154,8 @@ create	orphan	up-to-date	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
 create	orphan	drifted	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
 create	orphan	deleting-present	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
 create	orphan	deleting-absent	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
-create	orphaned	absent	1	1	0	0	false	-	-	-	True	ReconcileSuccess	-	CreatedExternalResource	-	resync
-create	orphaned	up-to-date	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
-create	orphaned	drifted	1	0	0	0	false	-	-	-	True	ReconcileSuccess	-	-	-	resync
+create	orphaned	absent	1	1	0	0	false	-	-	-	False	DeletionPolicyInvalid	krateo.io/deletion-policy "orphaned" is not "delete" or "orphan"; the external resource is kept	CreatedExternalResource	-	resync
+create	orphaned	up-to-date	1	0	0	0	false	-	-	-	False	DeletionPolicyInvalid	krateo.io/deletion-policy "orphaned" is not "delete" or "orphan"; the external resource is kept	-	-	resync
+create	orphaned	drifted	1	0	0	0	false	-	-	-	False	DeletionPolicyInvalid	krateo.io/deletion-policy "orphaned" is not "delete" or "orphan"; the external resource is kept	-	-	resync
 create	orphaned	deleting-present	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
 create	orphaned	deleting-absent	0	0	0	0	true	-	-	-	-	-	-	-	-	resync
