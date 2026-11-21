@@ -57,6 +57,12 @@ func IsAvailable(un *unstructured.Unstructured) (bool, error) {
 func SetConditions(un *unstructured.Unstructured, conds ...metav1.Condition) error {
 	conditions := GetConditions(un)
 	for _, cond := range conds {
+		// #115: a zero LastTransitionTime marshals to `lastTransitionTime: null`, a shape the
+		// apiserver's condition schema refuses and that every earlier reader crashed on. Stamp it
+		// here; Upsert still keeps the existing stamp when the status did not change (#36).
+		if cond.LastTransitionTime.IsZero() {
+			cond.LastTransitionTime = metav1.Now()
+		}
 		condition.Upsert(&conditions, cond)
 	}
 
@@ -68,19 +74,23 @@ func SetConditions(un *unstructured.Unstructured, conds ...metav1.Condition) err
 	return unstructured.SetNestedField(un.Object, res, "status", "conditions")
 }
 
-// GetConditions returns the conditions on un.
+// GetConditions returns the conditions on un, ENTRY BY ENTRY (#115).
 //
-// The message IS included, despite what this comment said until now — the loop below populates
-// `Message: message`. The stale "excluding the `message` field" wording nearly became a root cause:
-// core-provider's setReadyCondition short-circuits on `cur.Message == message`, so "the message is
-// stripped here" would have explained a condition being rewritten on every reconcile exactly, and I
-// believed it from the comment before reading the code three lines down.
+// It used to be all-or-nothing: one entry that was not a map, lacked a string type or status, or
+// whose lastTransitionTime was absent, null or not RFC3339 made it return nil for ALL of them, and a
+// present-but-null lastTransitionTime (what a zero metav1.Time marshals to) panicked on an unchecked
+// type assertion. Since SetConditions reads through here and writes the whole list back, one bad
+// stamp then ERASED every other condition on the next write: Ready and Synced vanished from a
+// resource that was being reconciled. Now:
+//   - an entry that cannot be identified (not a map, or no string type or status) is skipped, and
+//     only that entry: there is no condition to return for it;
+//   - a reason or message that is not a string reads as "";
+//   - a lastTransitionTime that is absent, null, not a string or not RFC3339 reads as the zero time,
+//     and the condition is KEPT: its status and reason are what callers decide on.
 //
-// ALL-OR-NOTHING ON PARSE FAILURE, which is the real hazard in here. Any condition whose
-// `lastTransitionTime` is absent or not RFC3339 makes this return nil for ALL conditions — so a
-// caller asking about Ready gets nothing because Synced was malformed, and a short-circuit keyed on
-// the result then fails open. Worth fixing separately; noted here because the signature gives no
-// hint of it.
+// The message IS included (the loop below populates it). core-provider's setReadyCondition
+// short-circuits on `cur.Message == message`, so a stale comment once claiming otherwise nearly became
+// a root cause.
 func GetConditions(un *unstructured.Unstructured) []metav1.Condition {
 	if un == nil {
 		return nil
@@ -90,38 +100,27 @@ func GetConditions(un *unstructured.Unstructured) []metav1.Condition {
 	for _, item := range items {
 		m, ok := item.(map[string]interface{})
 		if !ok {
-			return nil
+			continue
 		}
-		_, ok = m["type"].(string)
+		typ, ok := m["type"].(string)
+		if !ok || typ == "" {
+			continue
+		}
+		status, ok := m["status"].(string)
 		if !ok {
-			return nil
+			continue
 		}
-		_, ok = m["status"].(string)
-		if !ok {
-			return nil
+		reason, _ := m["reason"].(string)
+		message, _ := m["message"].(string)
+		var tm time.Time
+		if ts, ok := m["lastTransitionTime"].(string); ok {
+			if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
+				tm = parsed
+			}
 		}
-		var reason, message, t string
-		_, ok = m["reason"]
-		if ok {
-			reason = m["reason"].(string)
-		}
-		_, ok = m["message"]
-		if ok {
-			message = m["message"].(string)
-		}
-		_, ok = m["lastTransitionTime"]
-		if ok {
-			t = m["lastTransitionTime"].(string)
-		}
-
-		tm, err := time.Parse(time.RFC3339, t)
-		if err != nil {
-			return nil
-		}
-
 		x = append(x, metav1.Condition{
-			Type:               m["type"].(string),
-			Status:             metav1.ConditionStatus(m["status"].(string)),
+			Type:               typ,
+			Status:             metav1.ConditionStatus(status),
 			LastTransitionTime: metav1.Time{Time: tm},
 			Reason:             reason,
 			Message:            message,
