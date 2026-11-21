@@ -45,6 +45,9 @@ func TestExistenceUnanswerable_WrapIsTransparent(t *testing.T) {
 	require.Equal(t, cause.Error(), marked.Error(), "declaring it permanent must not change the message")
 	require.False(t, IsExistenceUndetermined(marked), "permanent is not transient")
 	require.NoError(t, ExistenceUnanswerable(nil))
+	// A handler may call the predicate unconditionally, including on the nil error of a definite
+	// answer (oasgen-provider wires it that way): nil is never unanswerable.
+	require.False(t, IsExistenceUnanswerable(nil))
 	// CONTROLS: an unmarked error and a transient one are NOT unanswerable.
 	require.False(t, IsExistenceUnanswerable(cause))
 	require.False(t, IsExistenceUnanswerable(ExistenceUndetermined(cause)))
