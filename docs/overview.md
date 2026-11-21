@@ -107,8 +107,9 @@ per-event pipeline **in this order**:
 3. **Pause**: if `krateo.io/paused: "true"`, set the `ReconcilePaused`
    condition and stop; removing the annotation retriggers (it is a default
    watched annotation).
-4. **Orphan delete**: if the CR is being deleted and the
-   `krateo.io/deletion-policy` is `orphan`, just remove the
+4. **Orphan delete**: if the CR is being deleted and the management decision
+   withholds delete (`krateo.io/deletion-policy` is `orphan` or unrecognised, or
+   the management policy has no `delete`), just remove the
    `composition.krateo.io/finalizer` — the external resource is left alone.
 5. **Incomplete-create recovery** — see below.
 6. **Finalizer**: ensure `composition.krateo.io/finalizer` on any live CR.

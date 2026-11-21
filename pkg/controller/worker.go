@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"github.com/krateo-platformops/plumbing/managementpolicy"
 	"github.com/krateo-platformops/unstructured-runtime/pkg/ratelimit"
 	"k8s.io/client-go/util/retry"
 	"time"
@@ -619,7 +620,7 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 	// If managed resource has a deletion timestamp and a deletion policy of
 	// Orphan, we do not need to observe the external resource before attempting
 	// to remove finalizer.
-	if meta.WasDeleted(el) && !meta.ShouldDelete(el) {
+	if meta.WasDeleted(el) && !meta.ManagementDecision(el).May(managementpolicy.Delete) {
 		log := lg.WithValues("deletion-timestamp", el.GetDeletionTimestamp())
 
 		if slices.Contains(el.GetFinalizers(), finalizerName) {
@@ -925,7 +926,7 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 	// resource whose policy forbids it. A withheld verb is dispatched as Observe instead, and
 	// handleObserve applies the policy's outcome (an error for observe-only on an absent resource,
 	// success otherwise), so there is one place that decides it.
-	if (evt.EventType == ctrlevent.Create && !meta.ShouldCreate(el)) || (evt.EventType == ctrlevent.Update && !meta.ShouldUpdate(el)) {
+	if d := meta.ManagementDecision(el); (evt.EventType == ctrlevent.Create && !d.May(managementpolicy.Create)) || (evt.EventType == ctrlevent.Update && !d.May(managementpolicy.Update)) {
 		lg.Debug("Dispatching as Observe: the management policy does not allow this verb",
 			"verb", evt.EventType, "policy", el.GetAnnotations()[meta.AnnotationKeyManagementPolicy])
 		evt.EventType = ctrlevent.Observe
@@ -1306,10 +1307,12 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 	//   - absent, create not allowed (`observe-delete`): nothing is created, the pass succeeds.
 	//   - drifted, update not allowed (`observe`, `observe-delete`): nothing is updated, the pass
 	//     succeeds (provider-runtime: "Skipping update due to managementPolicies").
-	createWithheld := !observation.ResourceExists && !meta.ShouldCreate(el)
-	updateWithheld := observation.ResourceExists && !observation.ResourceUpToDate && !meta.ShouldUpdate(el)
+	decision := meta.ManagementDecision(el)
+	createWithheld := !observation.ResourceExists && !decision.May(managementpolicy.Create)
+	updateWithheld := observation.ResourceExists && !observation.ResourceUpToDate && !decision.May(managementpolicy.Update)
+	onlyObserve := !decision.Policy.Allows(managementpolicy.Create) && !decision.Policy.Allows(managementpolicy.Update) && !decision.Policy.Allows(managementpolicy.Delete)
 
-	if !observation.ResourceExists && meta.ShouldOnlyObserve(el) {
+	if !observation.ResourceExists && onlyObserve {
 		persistHandlerConditions()
 		passErr := errors.Wrap(errors.New(errExternalResourceNotExist), errReconcileObserve)
 		c.recordEvent(el, event.Warning(reasonAbsentUnderPolicy, actionObserveExternalResource, passErr))
