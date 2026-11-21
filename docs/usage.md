@@ -82,6 +82,27 @@ recorders, pluralizer, no-op logger, disabled metrics server); every knob is a
   [overview](./overview.md#observe-must-be-side-effect-free).
 - Return errors as-is; the runtime sets conditions, emits events and retries
   through the rate limiter (up to `MaxRetries`, default 5).
+- **When the existence check cannot answer** (the incomplete-create recovery, while
+  `krateo.io/external-create-pending` is the newest create marker), say which kind
+  of "cannot":
+  - **transient**, wrap the error with `controller.ExistenceUndetermined`: a 5xx,
+    a timeout, an async operation still in flight, a resource reported Pending.
+    Ready is `Creating`, the error is returned and the check runs again with
+    backoff.
+  - **permanent**, wrap it with `controller.ExistenceUnanswerable` (since v1.32.0,
+    #119): the check can NEVER answer for this object, e.g. the read needs a
+    server-assigned id that was never recorded and the kind declares no lookup.
+    - Not being deleted: the object stays stopped, with the marker kept and no
+      create retried, so no duplicate can be made. Ready is
+      `False/CreateOutcomeUnknown`, and its message names the two ways out:
+      verify by hand and remove `krateo.io/external-create-pending`, or delete
+      the object.
+    - Being deleted: the finalizer is released **without** calling `Delete`. The
+      external resource, if one was created, is kept, and a Warning event
+      `ExternalResourceKeptExistenceUnanswerable` says so. Before, `kubectl
+      delete` hung on such an object for ever.
+  - **unmarked**, the default: `False/CreateOutcomeUnknown`, waiting until the
+    check answers, on reconcile and on delete alike.
 
 ## Operating a resource under this runtime
 
