@@ -220,6 +220,10 @@ type Options struct {
 	// process for the same resource waits instead of reconciling alongside. Nil: no Lease. See
 	// Ownership.
 	Ownership *Ownership
+
+	// CredentialUse protects what the handlers read while an object uses it (core-provider#402). Nil,
+	// the default, calls nothing and writes nothing.
+	CredentialUse CredentialUse
 }
 
 func (o Options) validate() error {
@@ -290,6 +294,14 @@ type Controller struct {
 	// Nil when no label selector is configured.
 	selector       labels.Selector
 	ownershipState ownershipState
+
+	// credentialUse is Options.CredentialUse; nil protects nothing. credentialUseTimeout is
+	// CredentialUseCallTimeout, a field so a test can shorten it.
+	credentialUse        CredentialUse
+	credentialUseTimeout time.Duration
+	// store and actionsEvent are what Enqueue reads: the informer's objects, and Options.ActionsEvent.
+	store        cache.Store
+	actionsEvent ctrlevent.ActionsEvent
 }
 
 var (
@@ -359,7 +371,7 @@ func New(sid *shortid.Shortid, opts Options) (*Controller, error) {
 		return nil, fmt.Errorf("failed to create listwatcher: %w", err)
 	}
 
-	_, informer := cache.NewInformerWithOptions(cache.InformerOptions{
+	store, informer := cache.NewInformerWithOptions(cache.InformerOptions{
 		ListerWatcher: lw,
 		ObjectType:    &unstructured.Unstructured{},
 		ResyncPeriod:  opts.ResyncInterval,
@@ -426,6 +438,13 @@ func New(sid *shortid.Shortid, opts Options) (*Controller, error) {
 				newUns, ok := new.(*unstructured.Unstructured)
 				if !ok {
 					log.Warn("Object is not an unstructured.")
+					return
+				}
+
+				// The pass that wrote the credential-use record carries on with the object it got
+				// back; an event for that write alone would only cause an extra pass.
+				if opts.CredentialUse != nil && opts.CredentialUse.IsOwnRecordWrite(oldUns, newUns) {
+					log.Debug("Ignoring an update that only wrote the credential-use record", "name", newUns.GetName(), "namespace", newUns.GetNamespace())
 					return
 				}
 
@@ -691,6 +710,10 @@ func New(sid *shortid.Shortid, opts Options) (*Controller, error) {
 		gracefulShutdownTimeout: gracefulShutdownTimeout,
 		ownership:               opts.Ownership,
 		selector:                selector,
+		credentialUse:           opts.CredentialUse,
+		credentialUseTimeout:    CredentialUseCallTimeout,
+		store:                   store,
+		actionsEvent:            opts.ActionsEvent,
 	}, nil
 }
 

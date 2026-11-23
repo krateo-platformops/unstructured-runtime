@@ -199,6 +199,13 @@ const (
 	outcomeFailure
 )
 
+// passSucceeded reports whether a pass did its work: it returned nil, or only asked to be run again as
+// a new event after it did (requeueAfter.next).
+func passSucceeded(err error) bool {
+	var again *requeueAfter
+	return err == nil || (errors.As(err, &again) && again.next != nil)
+}
+
 // classifyOutcome decides which metric a pass increments. A DEFERRAL IS A REQUEUE-AFTER, NOT A
 // FAILURE: counting it as one would show a failure spike on every dashboard for as long as a server
 // is rate-limiting us, telling an operator things are breaking when nothing is. Extracted from
@@ -207,11 +214,11 @@ func classifyOutcome(err error) passOutcome {
 	var deferred *ratelimit.DeferredError
 	var again *requeueAfter
 	switch {
-	case err == nil:
+	case passSucceeded(err):
 		return outcomeSuccess
 	case errors.As(err, &deferred), errors.As(err, &again):
 		return outcomeDeferred
-	case statusConflict(err):
+	case statusConflict(err), errors.Is(err, ErrCredentialUseConflict):
 		return outcomeStatusConflict
 	default:
 		return outcomeFailure
@@ -405,7 +412,7 @@ func (c *Controller) processNext(ctx context.Context, workerID string) bool {
 	// NOT MOVED AFTER handleErr, which is the fix that looks complete and is not: the
 	// NumRequeues check would then be correct while the count was still wiped afterwards, so
 	// the NEXT pass would start from zero and the backoff half would stay broken.
-	if err == nil {
+	if passSucceeded(err) {
 		c.queue.Forget(ev)
 	}
 	c.queue.Done(ev)
@@ -447,13 +454,20 @@ func (c *Controller) handleErr(err error, obj ctrlevent.Event, priority int) {
 	// BEFORE the re-add so the waiting key dedups whatever arrives meanwhile.
 	var again *requeueAfter
 	if errors.As(err, &again) {
-		dig := ctrlevent.DigestForEvent(obj)
+		next, prio := obj, again.priority
+		if again.next != nil {
+			next = *again.next
+		}
+		if again.keepPriority {
+			prio = priority
+		}
+		dig := ctrlevent.DigestForEvent(next)
 		if _, loaded := c.items.LoadOrStore(dig, struct{}{}); !loaded {
 			c.queue.AddWithOpts(priorityqueue.AddOpts{
 				After:       again.after,
 				RateLimited: false,
-				Priority:    again.priority,
-			}, obj)
+				Priority:    prio,
+			}, next)
 		}
 		return
 	}
@@ -490,6 +504,23 @@ func (c *Controller) handleErr(err error, obj ctrlevent.Event, priority int) {
 			c.queue.AddWithOpts(priorityqueue.AddOpts{
 				After:       statusConflictRequeue,
 				RateLimited: false,
+				Priority:    priority,
+			}, obj)
+		}
+		return
+	}
+
+	// A CREDENTIAL-USE RECORD WRITE THAT LOST A RACE is requeued quietly too, and ahead of the
+	// maxRetries check so it is never dropped. Rate-limited, unlike the two above: two writers that
+	// keep colliding on one object must back off.
+	if errors.Is(err, ErrCredentialUseConflict) {
+		retryEvent := obj
+		if retryEvent.QueuedAt.IsZero() {
+			retryEvent.QueuedAt = time.Now()
+		}
+		if _, loaded := c.items.LoadOrStore(ctrlevent.DigestForEvent(retryEvent), struct{}{}); !loaded {
+			c.queue.AddWithOpts(priorityqueue.AddOpts{
+				RateLimited: true,
 				Priority:    priority,
 			}, obj)
 		}
@@ -579,8 +610,8 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 	defer func() {
 		spanErr := err
 		var again *requeueAfter
-		if errors.As(err, &again) {
-			spanErr = nil // a planned requeue is not an error on the trace
+		if errors.As(err, &again) || errors.Is(err, ErrCredentialUseConflict) {
+			spanErr = nil // a planned requeue, and a lost record race, are not errors on the trace
 		}
 		telemetry.RecordSpanError(span, spanErr)
 		span.End()
@@ -629,6 +660,13 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 		return nil
 	}
 
+	// A deleting object whose finalizer is already gone but whose credential-use record is not: the
+	// record goes in a write of its own.
+	el, stop, err := c.dropStaleRecord(ctx, el, lg)
+	if stop {
+		return err
+	}
+
 	// If managed resource has a deletion timestamp and a deletion policy of
 	// Orphan, we do not need to observe the external resource before attempting
 	// to remove finalizer.
@@ -636,7 +674,7 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 		log := lg.WithValues("deletion-timestamp", el.GetDeletionTimestamp())
 
 		if slices.Contains(el.GetFinalizers(), finalizerName) {
-			meta.RemoveFinalizer(el, finalizerName)
+			c.releaseOwnFinalizer(el)
 			el, err = tools.Update(ctx, el, tools.UpdateOptions{
 				Pluralizer:    c.pluralizer,
 				DynamicClient: c.dynamicClient,
@@ -669,6 +707,16 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 		// precondition nothing enforces. See krateo-platformops/unstructured-runtime#23.
 		return nil
 	}
+
+	// CREDENTIAL USE (core-provider#402): the pass's one Acquire. Past every path that makes no
+	// external call (the pause, the orphan release), and before the first that may: the rate-limit key,
+	// the create recovery's existence check, and the dispatch. On a stop none of them runs, and the
+	// create-tracking annotations and the finalizer stay exactly as they are.
+	ctx, el, hold, err := c.acquireCredentialUse(ctx, el, evt.ObjectRef, lg)
+	if hold.stop {
+		return err
+	}
+	defer func() { err = hold.requeue(err, evt) }()
 
 	// If we started but never completed creation of an external resource we may
 	// have lost critical information (e.g. an unpersisted external name). The
@@ -951,6 +999,9 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 		exist := slices.Contains(finalizers, finalizerName)
 
 		if !exist {
+			if berr := c.beforeEstablish(ctx, el, hold, lg); berr != nil {
+				return berr
+			}
 			el.SetFinalizers(append(finalizers, finalizerName))
 			el, err = tools.Update(ctx, el, tools.UpdateOptions{
 				Pluralizer:    c.pluralizer,
@@ -1918,7 +1969,7 @@ func (c *Controller) handleDelete(ctx context.Context, ref objectref.ObjectRef) 
 	// #122: remove OUR finalizer only. This used to clear every finalizer ([]string{}), so another
 	// owner's finalizer (or Kubernetes' foregroundDeletion) was stripped and the object deleted
 	// while that owner still held it. The orphan path and the unanswerable-delete path already did this.
-	meta.RemoveFinalizer(el, finalizerName)
+	c.releaseOwnFinalizer(el)
 	el, err = tools.Update(ctx, el, tools.UpdateOptions{
 		Pluralizer:    c.pluralizer,
 		DynamicClient: c.dynamicClient,
@@ -2083,6 +2134,11 @@ func (c *Controller) enqueueFollowUp(item ctrlevent.Event) {
 type requeueAfter struct {
 	after    time.Duration
 	priority int
+	// keepPriority requeues at the priority the pass was dequeued with, instead of priority.
+	keepPriority bool
+	// next, when set, is the event to queue instead of the pass's own: the pass did its work, and what
+	// follows is a new pass rather than a repeat of this one.
+	next *ctrlevent.Event
 }
 
 func (r *requeueAfter) Error() string { return fmt.Sprintf("requeue after %s", r.after) }
@@ -2094,7 +2150,7 @@ func (c *Controller) releaseUnanswerableOnDelete(ctx context.Context, el *unstru
 	msg := fmt.Errorf("%s %s/%s is being deleted and its external resource's existence can never be checked, so its finalizer is released without a delete and the external resource, if one was created, is kept: %w",
 		el.GetKind(), el.GetNamespace(), el.GetName(), cause)
 	if slices.Contains(el.GetFinalizers(), finalizerName) {
-		meta.RemoveFinalizer(el, finalizerName)
+		c.releaseOwnFinalizer(el)
 		updated, err := tools.Update(ctx, el, tools.UpdateOptions{
 			Pluralizer:    c.pluralizer,
 			DynamicClient: c.dynamicClient,

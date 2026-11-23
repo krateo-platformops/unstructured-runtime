@@ -121,6 +121,7 @@ func Build(ctx context.Context, conf Configuration, optsFuncs ...FuncOption) (*c
 		TracerProvider:          opts.tracerProvider,
 		Ownership:               ownership,
 		SpanAttributes:          opts.spanAttributes,
+		CredentialUse:           opts.credentialUse,
 	})
 	if err != nil {
 		opts.logger.Error(err, "failed to create controller")

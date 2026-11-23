@@ -61,6 +61,9 @@ type options struct {
 	// ownership is the Lease the controller must hold to reconcile; nil => none. Build fills in
 	// its Leases client from the Configuration's rest.Config.
 	ownership *controller.Ownership
+
+	// credentialUse is controller.Options.CredentialUse; nil => none.
+	credentialUse controller.CredentialUse
 }
 
 func defaultOptions() options {
@@ -133,6 +136,15 @@ func WithSpanAttributes(attrs ...attribute.KeyValue) func(o *options) {
 func WithOwnership(namespace, name, identity string) func(o *options) {
 	return func(o *options) {
 		o.ownership = &controller.Ownership{Namespace: namespace, Name: name, Identity: identity}
+	}
+}
+
+// WithCredentialUse protects what the handlers read (Secrets, and the objects that lead to them) while
+// an object uses it. Unset, the controller behaves exactly as without it. An implementation that asks
+// for passes does so with the built controller's Enqueue. See controller.CredentialUse.
+func WithCredentialUse(cu controller.CredentialUse) func(o *options) {
+	return func(o *options) {
+		o.credentialUse = cu
 	}
 }
 
