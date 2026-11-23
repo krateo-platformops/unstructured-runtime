@@ -144,6 +144,11 @@ func TestExistenceUnanswerable_NotDeleting_ControlsUnchanged(t *testing.T) {
 	r := unansReady(t, got)
 	require.Equal(t, string(condition.ReasonCreateOutcomeUnknown), r.Reason)
 	require.Contains(t, r.Message, "clearing by itself", "the unmarked path keeps errCreateIncomplete")
+	// The remediation must warn that removing the annotation enqueues a create at once: the runtime itself
+	// CLOSES the marker rather than deleting it for that reason (createNotRequested, oasgen-provider#674),
+	// so advising the deletion without the warning tells an operator to do what the runtime refuses to.
+	require.Contains(t, r.Message, "enqueues a create immediately", "the remediation names the side effect of removing the annotation")
+	require.Contains(t, r.Message, "does NOT exist", "the remediation says to remove it only once the resource is verified absent")
 
 	transient := &existenceClient{err: ExistenceUndetermined(errors.New("async operation still in flight"))}
 	perr, got, _ = unanswerablePass(t, "unans-ctl-transient", false, transient)
