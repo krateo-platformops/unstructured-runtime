@@ -102,7 +102,8 @@ const (
 	// keeps blocking, and once the cause is solved nothing needs a human.
 	errCreateIncomplete = "cannot determine creation result; reconciliation and deletion both wait for it, and it is checked again on every resync, " +
 		"clearing by itself once the existence check answers - remove the " + meta.AnnotationKeyExternalCreatePending +
-		" annotation only if that check can never answer, after verifying whether the external resource exists"
+		" annotation only if that check can never answer, and only after verifying that the external resource does NOT exist: " +
+		"removing it enqueues a create immediately (oasgen-provider#674), so removing it while the resource exists creates a duplicate"
 	// errCreatePendingUndetermined is the MARKED counterpart of errCreateIncomplete, and it exists
 	// because that string's remediation is destructive for exactly the case a handler marks transient:
 	// it tells an operator to remove the create-pending annotation, which hands the resource back to a
