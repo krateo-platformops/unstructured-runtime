@@ -703,6 +703,46 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 	}
 	defer release()
 
+	// "SAFE TO RETRY BLINDLY" IS TRUE ABOUT THE CREATE AND NOT ABOUT THE WORLD.
+	//
+	// ErrCreateNotCommitted's doc is right that a classified refusal is safe to retry: the vendor
+	// refused, so nothing was created. What it cannot say is that nothing was created BY ANOTHER
+	// ROUTE between the refusal and the retry. A consumer measured exactly that: a Keycloak policy
+	// create was refused 404 "Realm not found"; the realm then appeared and Keycloak created its own
+	// default policy with it; the retry 1.7 s later made a second one. 24 of 24 CRs duplicated, and
+	// they then sat unrecoverable at "findby matched 2 or more items on the declared identifiers".
+	//
+	// SO THE NEGATIVE IS CONFIRMED HERE, and the block below is untouched. Stamping failed makes the
+	// failure the newest marker, which is what suppresses the incomplete-create recovery -- and that
+	// suppression is deliberate, so a classified refusal keeps retrying directly instead of waiting
+	// out the recovery grace period or stopping where nothing can be observed. That intent is
+	// preserved exactly: this adopts ONLY on a definite yes, and every other answer -- absent, or a
+	// check that cannot answer -- falls through to the retry this already did.
+	//
+	// ADOPT RATHER THAN RETRY, on a yes. A second external resource cannot be withdrawn; a false
+	// adoption is corrected by the next observe.
+	//
+	// TOP-LEVEL AND AFTER THE GATE, which the wiring test above requires: an external-client call
+	// from inside a handler would reach the endpoint without passing acquireRateLimit.
+	if !meta.ExternalCreateIncomplete(el) && meta.ExternalCreateRefusedUnconfirmed(el) {
+		if exists, obsErr := c.externalResourceExists(ctx, el); obsErr != nil {
+			lg.Info("Create was refused and its absence cannot be confirmed; retrying as classified",
+				"error", obsErr.Error())
+		} else if exists {
+			lg.Info("Create was refused, but the external resource now exists; adopting it instead of creating again")
+			meta.SetExternalCreateSucceeded(el, time.Now())
+			if _, uerr := tools.Update(ctx, el, tools.UpdateOptions{
+				Pluralizer:    c.pluralizer,
+				DynamicClient: c.dynamicClient,
+			}); uerr != nil {
+				lg.Error(uerr, "Cannot update managed resource")
+				c.recordEvent(el, event.Warning(reasonCannotUpdateManaged, actionUpdateManagedResource, uerr))
+				return uerr
+			}
+			return nil
+		}
+	}
+
 	if meta.ExternalCreateIncomplete(el) {
 		resourceExists, obsErr := c.externalResourceExists(ctx, el)
 

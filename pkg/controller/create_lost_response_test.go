@@ -36,7 +36,7 @@ func (v *vendorClient) Create(ctx context.Context, mg *unstructured.Unstructured
 	return v.createErr
 }
 
-func lostResponseRun(t *testing.T, client *vendorClient, passes int) *unstructured.Unstructured {
+func lostResponseRun(t *testing.T, client ExternalClient, passes int) *unstructured.Unstructured {
 	t.Helper()
 	sid, err := shortid.New(1, shortid.DefaultABC, 2342)
 	require.NoError(t, err)
