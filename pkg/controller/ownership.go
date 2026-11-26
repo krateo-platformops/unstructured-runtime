@@ -51,7 +51,12 @@ type Ownership struct {
 	Identity string
 
 	// LeaseDuration, RenewDeadline and RetryPeriod are client-go's leader-election timings. Zero
-	// takes the default (15s, 10s, 2s), the same as controller-runtime's.
+	// takes the default (15s, 10s, 2s), the same as controller-runtime's. Together they must satisfy
+	// client-go's rules (ValidateOwnershipTimings); a set that does not is refused by New, before
+	// anything runs, rather than by the elector after the first list.
+	//
+	// RetryPeriod is how often a holder renews, so it is the Lease's write rate at rest: one PUT per
+	// RetryPeriod per controller (0.5/s at the default).
 	LeaseDuration time.Duration
 	RenewDeadline time.Duration
 	RetryPeriod   time.Duration
@@ -79,6 +84,31 @@ func (o *Ownership) validate() error {
 		return fmt.Errorf("ownership: the Lease namespace and name are required")
 	case o.Identity == "":
 		return fmt.Errorf("ownership: an identity is required")
+	}
+	if err := ValidateOwnershipTimings(o.LeaseDuration, o.RenewDeadline, o.RetryPeriod); err != nil {
+		return fmt.Errorf("ownership: %w", err)
+	}
+	return nil
+}
+
+// ValidateOwnershipTimings reports whether leaseDuration, renewDeadline and retryPeriod, each zero
+// for its default as in Ownership, are a set client-go's elector accepts: leaseDuration >
+// renewDeadline > retryPeriod x leaderelection.JitterFactor (1.2), all greater than zero. These are
+// leaderelection.NewLeaderElector's own checks, made here so that a process can refuse an invalid set
+// at startup, and so that New refuses it instead of Run failing only once the informer has synced.
+func ValidateOwnershipTimings(leaseDuration, renewDeadline, retryPeriod time.Duration) error {
+	lease, renew, retry := (&Ownership{LeaseDuration: leaseDuration, RenewDeadline: renewDeadline, RetryPeriod: retryPeriod}).timings()
+	bad := func(rule string) error {
+		return fmt.Errorf("invalid ownership lease timings leaseDuration=%s renewDeadline=%s retryPeriod=%s: %s",
+			lease, renew, retry, rule)
+	}
+	switch {
+	case lease < 0 || renew < 0 || retry < 0:
+		return bad("every timing must be greater than zero")
+	case lease <= renew:
+		return bad("leaseDuration must be greater than renewDeadline")
+	case renew <= time.Duration(leaderelection.JitterFactor*float64(retry)):
+		return bad(fmt.Sprintf("renewDeadline must be greater than retryPeriod x %v (client-go's JitterFactor)", leaderelection.JitterFactor))
 	}
 	return nil
 }

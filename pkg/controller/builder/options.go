@@ -61,7 +61,13 @@ type options struct {
 	// ownership is the Lease the controller must hold to reconcile; nil => none. Build fills in
 	// its Leases client from the Configuration's rest.Config.
 	ownership *controller.Ownership
+
+	// ownershipTimings are the Lease's timings (WithOwnershipTimings), applied to ownership by Build;
+	// nil => controller.Ownership's defaults. Kept apart so the two options apply in either order.
+	ownershipTimings *ownershipTimings
 }
+
+type ownershipTimings struct{ leaseDuration, renewDeadline, retryPeriod time.Duration }
 
 func defaultOptions() options {
 	watchAnnotations := ctrlevent.NewAnnotationEvents()
@@ -133,6 +139,18 @@ func WithSpanAttributes(attrs ...attribute.KeyValue) func(o *options) {
 func WithOwnership(namespace, name, identity string) func(o *options) {
 	return func(o *options) {
 		o.ownership = &controller.Ownership{Namespace: namespace, Name: name, Identity: identity}
+	}
+}
+
+// WithOwnershipTimings sets the ownership Lease's client-go timings (controller.Ownership's
+// LeaseDuration, RenewDeadline and RetryPeriod; zero keeps that one's default). It applies only with
+// WithOwnership, in either order, and Build refuses a set controller.ValidateOwnershipTimings rejects.
+//
+// Every process that competes for the same Lease should be given the same timings: a successor waits
+// out the HOLDER's leaseDuration (it is written on the Lease), and a holder renews every retryPeriod.
+func WithOwnershipTimings(leaseDuration, renewDeadline, retryPeriod time.Duration) func(o *options) {
+	return func(o *options) {
+		o.ownershipTimings = &ownershipTimings{leaseDuration: leaseDuration, renewDeadline: renewDeadline, retryPeriod: retryPeriod}
 	}
 }
 
