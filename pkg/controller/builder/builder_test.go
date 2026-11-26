@@ -158,3 +158,26 @@ func TestDefaultOptions_WatchThePolicyAnnotations(t *testing.T) {
 	}
 	require.False(t, o.watchAnnotations.HasAnnotation("example.org/not-watched"), "control: an unwatched annotation reads as watched")
 }
+
+// WithOwnershipTimings reaches the Lease's Ownership in either order with WithOwnership: an invalid set
+// is refused by Build, naming the three values applied. CONTROLS: the same set without WithOwnership
+// builds (no Lease, nothing to time), and a valid set builds.
+func TestWithOwnershipTimings(t *testing.T) {
+	conf := Configuration{Config: &rest.Config{}, GVR: schema.GroupVersionResource{Group: "g", Version: "v", Resource: "r"}, ProviderName: "p"}
+	own := WithOwnership("krateo-system", "v.r.g", "pod-a")
+	bad := WithOwnershipTimings(10*time.Second, 10*time.Second, 3*time.Second)
+	for name, opts := range map[string][]FuncOption{"timings after": {own, bad}, "timings before": {bad, own}} {
+		_, err := Build(context.Background(), conf, opts...)
+		require.ErrorContains(t, err, "leaseDuration=10s renewDeadline=10s retryPeriod=3s", name)
+		require.ErrorContains(t, err, "leaseDuration must be greater than renewDeadline", name)
+	}
+	_, err := Build(context.Background(), conf, bad)
+	require.NoError(t, err, "control: timings without a Lease")
+	_, err = Build(context.Background(), conf, own, WithOwnershipTimings(30*time.Second, 20*time.Second, 5*time.Second))
+	require.NoError(t, err, "control: a valid set")
+
+	o := defaultOptions()
+	require.Nil(t, o.ownershipTimings)
+	WithOwnershipTimings(30*time.Second, 20*time.Second, 5*time.Second)(&o)
+	require.Equal(t, &ownershipTimings{30 * time.Second, 20 * time.Second, 5 * time.Second}, o.ownershipTimings)
+}

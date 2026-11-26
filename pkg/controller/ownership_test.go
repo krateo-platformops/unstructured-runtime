@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -10,11 +11,14 @@ import (
 
 	"github.com/stretchr/testify/require"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/leaderelection"
+	"k8s.io/client-go/tools/leaderelection/resourcelock"
 )
 
 // Short timings so a handover takes about a second; the ratios are client-go's (lease > renew >
@@ -238,6 +242,8 @@ func TestOwnership_Validate(t *testing.T) {
 		"no namespace": func(o *Ownership) { o.Namespace = "" },
 		"no name":      func(o *Ownership) { o.Name = "" },
 		"no identity":  func(o *Ownership) { o.Identity = "" },
+		// The timings are checked by New, not first by the elector after the informer has synced.
+		"renewDeadline not below leaseDuration": func(o *Ownership) { o.LeaseDuration, o.RenewDeadline = 2*time.Second, 2*time.Second },
 	} {
 		o := *ok
 		mut(&o)
@@ -263,5 +269,91 @@ func TestOwnership_HolderChangeMessage(t *testing.T) {
 		if got := holderChangeMessage("pod-a", tc.holder, tc.prev, tc.changed); got != tc.want {
 			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
 		}
+	}
+}
+
+// ValidateOwnershipTimings accepts exactly the sets client-go's elector accepts. Each case is checked
+// twice: against a literal verdict, and against leaderelection.NewLeaderElector itself, the independent
+// source, with the defaults resolved the way Ownership resolves them.
+func TestValidateOwnershipTimings(t *testing.T) {
+	s := time.Second
+	for _, c := range []struct {
+		lease, renew, retry time.Duration
+		ok                  bool
+		says                string
+	}{
+		{0, 0, 0, true, ""},
+		{15 * s, 10 * s, 2 * s, true, ""},
+		{30 * s, 20 * s, 5 * s, true, ""},
+		{60 * s, 40 * s, 15 * s, true, ""},
+		{7 * s, 6100 * time.Millisecond, 5 * s, true, ""},
+		{20 * s, 20 * s, 5 * s, false, "leaseDuration must be greater than renewDeadline"},
+		{20 * s, 30 * s, 5 * s, false, "leaseDuration must be greater than renewDeadline"},
+		{7 * s, 6 * s, 5 * s, false, "renewDeadline must be greater than retryPeriod x 1.2"},
+		{30 * s, 20 * s, 20 * s, false, "renewDeadline must be greater than retryPeriod x 1.2"},
+		{0, 20 * s, 0, false, "leaseDuration must be greater than renewDeadline"}, // 15s default lease
+		{-30 * s, 20 * s, 5 * s, false, "greater than zero"},
+		{30 * s, 20 * s, -5 * s, false, "greater than zero"},
+	} {
+		name := fmt.Sprintf("%s/%s/%s", c.lease, c.renew, c.retry)
+		t.Run(name, func(t *testing.T) {
+			err := ValidateOwnershipTimings(c.lease, c.renew, c.retry)
+			if c.ok {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, c.says)
+			}
+			lease, renew, retry := (&Ownership{LeaseDuration: c.lease, RenewDeadline: c.renew, RetryPeriod: c.retry}).timings()
+			_, cgErr := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
+				Lock:          &resourcelock.LeaseLock{LockConfig: resourcelock.ResourceLockConfig{Identity: "pod-a"}},
+				LeaseDuration: lease, RenewDeadline: renew, RetryPeriod: retry,
+				Callbacks: leaderelection.LeaderCallbacks{OnStartedLeading: func(context.Context) {}, OnStoppedLeading: func() {}},
+			})
+			require.Equal(t, cgErr == nil, err == nil, "client-go says %v, ValidateOwnershipTimings says %v", cgErr, err)
+		})
+	}
+}
+
+// The timings reach the elector: the Lease it writes carries this controller's leaseDuration, which
+// is what a successor waits out. CONTROL: the default controller writes the default 15s.
+func TestOwnership_TheLeaseCarriesItsDuration(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		lease time.Duration
+		want  int32
+	}{{"set", 7 * time.Second, 7}, {"default", 0, 15}} {
+		t.Run(c.name, func(t *testing.T) {
+			cs := kubefake.NewClientset()
+			o := testOwnership(cs, "pod-a")
+			o.LeaseDuration = c.lease
+			if c.lease == 0 {
+				o.RenewDeadline, o.RetryPeriod = 0, 0
+			}
+			ctrl := ownedController(t, o, &mockExternalClient{
+				observeFunc: func(ctx context.Context, mg *unstructured.Unstructured) (ExternalObservation, error) {
+					return ExternalObservation{ResourceExists: true, ResourceUpToDate: true}, nil
+				},
+			})
+			ctx, stop := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- ctrl.Run(ctx, 1) }()
+			var got int32
+			waitForOwnership(t, "the Lease to be taken", 10*time.Second, func() bool {
+				l, err := cs.CoordinationV1().Leases(o.Namespace).Get(context.Background(), o.Name, metav1.GetOptions{})
+				if err != nil || l.Spec.LeaseDurationSeconds == nil {
+					return false
+				}
+				got = *l.Spec.LeaseDurationSeconds
+				return true
+			})
+			require.Equal(t, c.want, got)
+			stop()
+			select {
+			case err := <-done:
+				require.NoError(t, err)
+			case <-time.After(15 * time.Second):
+				t.Fatal("Run did not return")
+			}
+		})
 	}
 }

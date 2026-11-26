@@ -97,6 +97,9 @@ func Build(ctx context.Context, conf Configuration, optsFuncs ...FuncOption) (*c
 		}
 		o := *opts.ownership
 		o.Leases = cs.CoordinationV1()
+		if t := opts.ownershipTimings; t != nil {
+			o.LeaseDuration, o.RenewDeadline, o.RetryPeriod = t.leaseDuration, t.renewDeadline, t.retryPeriod
+		}
 		ownership = &o
 	}
 
