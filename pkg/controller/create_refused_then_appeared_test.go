@@ -150,6 +150,11 @@ func TestARefusedCreateThatIsStillAbsentLogsTheConfirmOncePerPass(t *testing.T) 
 		n++
 		require.Contains(t, (*rec.kv)[i], "createFailedAt", "the line must carry the refusal's own time")
 	}
+	// 3 confirms from 4 passes is by construction, not an off-by-one. Pass 1 issues the create and is
+	// refused; meta.ExternalCreateRefusedUnconfirmed (pkg/meta/meta.go) returns false on it because no
+	// external-create-pending marker exists yet (its `pending.IsZero()` guard), so processItem never
+	// enters the confirm block on pass 1 and the confirm is reachable only from pass 2 onward. If this
+	// number ever needs to change, the pass count or that predicate changed -- not this assertion.
 	require.Equal(t, 3, n, "the still-absent confirm must log once per pass that runs it; got %v", *rec.debug)
 	require.Equal(t, 4, client.creates)
 }
