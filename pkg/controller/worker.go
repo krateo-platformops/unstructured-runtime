@@ -729,6 +729,13 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 		if exists, obsErr := c.externalResourceExists(ctx, el); obsErr != nil {
 			lg.Info("Create was refused and its absence cannot be confirmed; retrying as classified",
 				"error", obsErr.Error())
+		} else if !exists {
+			// Per attempt, at Debug: off by default, so the per-retry volume exists only when asked
+			// for, and not one-shot, because the residual duplicates are the LATER retries. The
+			// refusal's own time says which refusal this confirm answered. The object's identity
+			// (kind, apiVersion, name, namespace) is already on lg, as for the two outcomes below.
+			lg.Debug("Create was refused and the external resource is still absent; retrying as classified",
+				"createFailedAt", meta.GetExternalCreateFailed(el))
 		} else if exists {
 			lg.Info("Create was refused, but the external resource now exists; adopting it instead of creating again")
 			meta.SetExternalCreateSucceeded(el, time.Now())

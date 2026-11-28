@@ -3,10 +3,17 @@ package controller
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
+	"github.com/krateo-platformops/plumbing/shortid"
+	contextutils "github.com/krateo-platformops/unstructured-runtime/pkg/context"
+	ctrlevent "github.com/krateo-platformops/unstructured-runtime/pkg/controller/event"
+	"github.com/krateo-platformops/unstructured-runtime/pkg/controller/objectref"
+	"github.com/krateo-platformops/unstructured-runtime/pkg/logging"
 	"github.com/krateo-platformops/unstructured-runtime/pkg/meta"
 	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
@@ -89,4 +96,60 @@ func TestARefusedCreateThatIsStillAbsentRetriesAsBefore(t *testing.T) {
 	require.Equal(t, 3, client.creates, "a refused create of a resource that does not exist must retry each pass")
 	require.False(t, meta.GetExternalCreateFailed(got).IsZero(), "it must be recorded as failed")
 	require.True(t, meta.GetExternalCreateSucceeded(got).IsZero(), "nothing was created, so nothing may be adopted")
+}
+
+// debugRecorder records the message and fields of every Debug line it is given, through WithValues
+// children (which share the same sink).
+type debugRecorder struct {
+	logging.Logger
+	mu    *sync.Mutex
+	debug *[]string
+	kv    *[][]any
+}
+
+func (r debugRecorder) Debug(msg string, kv ...any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	*r.debug = append(*r.debug, msg)
+	*r.kv = append(*r.kv, kv)
+}
+func (r debugRecorder) WithValues(...any) logging.Logger { return r }
+func (r debugRecorder) WithName(string) logging.Logger   { return r }
+
+// The confirm's third outcome used to fall through silently, leaving a gap in the log between the
+// last refusal and the next create. It must log at Debug, once per pass, naming the refusal it
+// confirmed.
+func TestARefusedCreateThatIsStillAbsentLogsTheConfirmOncePerPass(t *testing.T) {
+	const msg = "Create was refused and the external resource is still absent; retrying as classified"
+	rec := debugRecorder{Logger: logging.NewNopLogger(), mu: &sync.Mutex{}, debug: new([]string), kv: new([][]any)}
+
+	client := &appearsLaterClient{appearsFrom: 99}
+	sid, err := shortid.New(1, shortid.DefaultABC, 2342)
+	require.NoError(t, err)
+	opts := createTestOptions()
+	ctrl, err := New(sid, opts)
+	require.NoError(t, err)
+	ctrl.externalClient = client
+	obj := createTestUnstructured("still-absent-log", opts.Namespace)
+	created, err := opts.Client.Resource(opts.GVR).Namespace(opts.Namespace).Create(context.TODO(), obj, metav1.CreateOptions{})
+	require.NoError(t, err)
+	evt := ctrlevent.Event{EventType: ctrlevent.Create, ObjectRef: objectref.ObjectRef{
+		APIVersion: created.GetAPIVersion(), Kind: created.GetKind(), Name: created.GetName(), Namespace: created.GetNamespace()}}
+	ctx := contextutils.BuildContext(context.TODO(), contextutils.WithLogger(rec))
+
+	// Pass 1 is the refusal itself; the confirm runs from pass 2 on, so 4 passes give 3 confirms.
+	for i := 0; i < 4; i++ {
+		require.Error(t, ctrl.processItem(ctx, evt))
+	}
+
+	n := 0
+	for i, m := range *rec.debug {
+		if m != msg {
+			continue
+		}
+		n++
+		require.Contains(t, (*rec.kv)[i], "createFailedAt", "the line must carry the refusal's own time")
+	}
+	require.Equal(t, 3, n, "the still-absent confirm must log once per pass that runs it; got %v", *rec.debug)
+	require.Equal(t, 4, client.creates)
 }
