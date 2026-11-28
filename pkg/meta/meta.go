@@ -321,6 +321,38 @@ func ExternalCreateIncomplete(o metav1.Object) bool {
 	return pending.After(latest)
 }
 
+// ExternalCreateRefusedUnconfirmed reports that a create was attempted, the handler classified its
+// failure as not-committed (so the runtime stamped failed), and nothing has confirmed the external
+// resource's existence since.
+//
+// SEPARATE FROM ExternalCreateIncomplete, and deliberately so. That predicate means "a create pass
+// started and did not finish", which is false here: this pass finished, with a refusal. What this one
+// means is narrower -- "the last create was refused, and we have not looked since" -- and it exists
+// because a refusal correctly classified as not-committed is safe to retry blindly AT THE MOMENT OF
+// CLASSIFICATION and not two seconds later. The resource can appear by a route this controller did
+// not take, and then the retry duplicates it.
+func ExternalCreateRefusedUnconfirmed(o metav1.Object) bool {
+	pending := GetExternalCreatePending(o)
+	if pending.IsZero() {
+		return false
+	}
+	failed := GetExternalCreateFailed(o)
+	if failed.Before(pending) {
+		// Not the outcome of the most recent attempt.
+		return false
+	}
+	// TIES RESOLVE IN FAVOUR OF "DONE", as ExternalCreateIncomplete's do and for the same reason: the
+	// timestamps are second-granular, so an adoption recorded in the same second as the refusal it
+	// supersedes must not read as still-unconfirmed. Written with After() first, this returned true
+	// immediately after a successful adoption and the next pass confirmed all over again.
+	for _, t := range []time.Time{GetExternalCreateSucceeded(o), GetExternalCreateNotRequested(o)} {
+		if !t.IsZero() && !t.Before(failed) {
+			return false
+		}
+	}
+	return true
+}
+
 // ExternalCreateSucceededDuring returns true if creation of the external
 // resource that corresponds to the supplied managed resource succeeded within
 // the supplied duration.
