@@ -553,6 +553,7 @@ func (c *Controller) processItem(ctx context.Context, obj interface{}) (err erro
 		if apierrors.IsNotFound(err) {
 			// The object is gone: its trace memo entry goes with it, tracing on or off (#77).
 			c.traces.forget(traceKey)
+			c.recheckPending.Delete(ref2key(evt.ObjectRef))
 		}
 		// if the object is not found, we will not retry to process it and we not throw an error
 		return nil
@@ -1193,7 +1194,7 @@ func deferralAlreadyRecorded(el *unstructured.Unstructured, cond metav1.Conditio
 	return false
 }
 
-func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef) error {
+func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef) (retErr error) {
 	log := contextutils.Logger(ctx).WithValues("event", "observe").WithValues("traceId", contextutils.TraceId(ctx, false))
 
 	if c.externalClient == nil {
@@ -1238,6 +1239,12 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 	// marker conflict comes back as its error and requeues quietly below (statusConflict).
 	tracePassFrom(ctx).observing(el)
 	observation, actionErr := c.externalClient.Observe(ctx, el)
+	// The handler's RecheckAfter is honoured on every NIL return from here on, and only there.
+	defer func() {
+		if retErr == nil {
+			c.scheduleRecheck(ref, observation.RecheckAfter)
+		}
+	}()
 	if c.metrics != nil {
 		c.metrics.RecordObserveDuration(ctx, time.Since(start))
 		if actionErr != nil {
@@ -1509,7 +1516,7 @@ func (c *Controller) handleObserve(ctx context.Context, ref objectref.ObjectRef)
 	return nil
 }
 
-func (c *Controller) handleCreate(ctx context.Context, ref objectref.ObjectRef) error {
+func (c *Controller) handleCreate(ctx context.Context, ref objectref.ObjectRef) (retErr error) {
 	log := contextutils.Logger(ctx).WithValues("event", "create").WithValues("traceId", contextutils.TraceId(ctx, false))
 
 	if c.externalClient == nil {
@@ -1582,6 +1589,11 @@ func (c *Controller) handleCreate(ctx context.Context, ref objectref.ObjectRef) 
 	// processItem's rate-limit gate (TestRateLimitGateIsTheOnlyWayToTheExternalClient).
 	var created CreateResult
 	var actionErr error
+	defer func() {
+		if retErr == nil {
+			c.scheduleRecheck(ref, created.RecheckAfter)
+		}
+	}()
 	if rc, ok := c.externalClient.(ResultCreator); ok {
 		created, actionErr = rc.CreateWithResult(actCtx, el)
 	} else {
@@ -2150,4 +2162,59 @@ func (c *Controller) releaseUnanswerableOnDelete(ctx context.Context, el *unstru
 	lg.Warn("Existence can never be checked for an object being deleted; finalizer released, external resource kept", "error", cause.Error())
 	c.recordEvent(el, event.Warning(reasonKeptExistenceUnanswerable, actionDeleteExternalResource, msg))
 	return nil
+}
+
+// MinRecheckAfter is the floor of a handler's RecheckAfter. A hint below it is raised to it, so a
+// handler that returns a tiny or constant hint cannot turn the queue into a hot loop.
+const MinRecheckAfter = time.Second
+
+// clampRecheck maps a handler's RecheckAfter to the delay actually used. ok is false for zero (and
+// negative): no hint, today's behaviour. Otherwise the result lies in [MinRecheckAfter, resync]; a
+// hint longer than the resync period is what resync already does, so it is clamped down to it. If the
+// resync period is itself below the floor the ceiling wins.
+func clampRecheck(hint, resync time.Duration) (d time.Duration, ok bool) {
+	if hint <= 0 {
+		return 0, false
+	}
+	if hint < MinRecheckAfter {
+		hint = MinRecheckAfter
+	}
+	if resync > 0 && hint > resync {
+		hint = resync
+	}
+	return hint, true
+}
+
+func ref2key(r objectref.ObjectRef) string {
+	return r.APIVersion + "|" + r.Kind + "|" + r.Namespace + "|" + r.Name
+}
+
+// scheduleRecheck queues an Observe for ref after the clamped hint. It is called only on a nil-error
+// return (handleObserve, handleCreate), makes no external call, and is not an entry point: the queued
+// Observe goes through processItem, hence the rate-limit gate, like any other.
+//
+// AddAfter semantics (AddOpts.After, RateLimited false), NOT AddRateLimited, for the reason handleErr
+// gives for a deferral: a rate-limited add counts toward NumRequeues and grows the item's backoff,
+// and a hint that will settle on its own is not a failure. No digest is stored, so a watch event
+// arriving before it fires is queued at once and runs first, as today. recheckPending keeps one
+// recheck per object: a pending one that fires no later than this one makes this one redundant.
+func (c *Controller) scheduleRecheck(ref objectref.ObjectRef, hint time.Duration) {
+	d, ok := clampRecheck(hint, c.resyncPeriod)
+	if !ok {
+		return
+	}
+	now := time.Now()
+	deadline := now.Add(d)
+	key := ref2key(ref)
+	if v, loaded := c.recheckPending.Load(key); loaded {
+		if pending := v.(time.Time); pending.After(now) && !pending.After(deadline) {
+			return
+		}
+	}
+	c.recheckPending.Store(key, deadline)
+	c.queue.AddWithOpts(priorityqueue.AddOpts{
+		After:       d,
+		RateLimited: false,
+		Priority:    LowPriority, // a patient settle check, like the resync's own Observe
+	}, ctrlevent.Event{EventType: ctrlevent.Observe, ObjectRef: ref, QueuedAt: now})
 }
