@@ -137,7 +137,10 @@ func TestARefusedCreateThatIsStillAbsentLogsTheConfirmOncePerPass(t *testing.T) 
 		APIVersion: created.GetAPIVersion(), Kind: created.GetKind(), Name: created.GetName(), Namespace: created.GetNamespace()}}
 	ctx := contextutils.BuildContext(context.TODO(), contextutils.WithLogger(rec))
 
-	// Pass 1 is the refusal itself; the confirm runs from pass 2 on, so 4 passes give 3 confirms.
+	// Pass 1 is the refusal itself: ExternalCreateRefusedUnconfirmed is false until
+	// external-create-pending exists (meta.go:336, pending.IsZero()), so the confirm runs from
+	// pass 2 on and 4 passes give 3 confirms. If this number has to change, the pass count or
+	// that predicate changed, not the assertion.
 	for i := 0; i < 4; i++ {
 		require.Error(t, ctrl.processItem(ctx, evt))
 	}
