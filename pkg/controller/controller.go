@@ -91,6 +91,12 @@ type CreateResult struct {
 	Requested bool
 	// Reason says why nothing was requested, when Requested is false. It is logged.
 	Reason string
+	// RecheckAfter asks the runtime to observe this object again after about this long, because the
+	// outcome of this pass will settle on its own and nothing else would schedule a look at it: without
+	// a hint the next pass waits for a watch event or the next resync. See RecheckAfter on
+	// ExternalObservation for the clamp and the rules; they are the same here. Honoured only on a nil
+	// error, whatever Requested says. Zero is no hint, exactly as before.
+	RecheckAfter time.Duration
 	// Conditions the client wants recorded for this create.
 	//
 	// On a nil error they are applied exactly as ExternalObservation.Conditions are on Observe
@@ -145,6 +151,21 @@ type ExternalObservation struct {
 	// appears to be up-to-date - i.e. updating the external resource to match
 	// the desired state of the managed resource would be a no-op.
 	ResourceUpToDate bool
+
+	// RecheckAfter asks the runtime to observe this object again after about this long. A handler
+	// whose outcome will settle on its own (an adopt that has not yet converged, a kind it cannot GET)
+	// schedules nothing otherwise, so recovery waits a full resync.
+	//
+	//   zero          no hint: exactly today's behaviour. Every existing handler is unchanged.
+	//   otherwise     clamped to [MinRecheckAfter, the resync period]. The floor keeps a handler bug from
+	//                 becoming a hot loop; longer than the resync period is what resync already does.
+	//   scheduling    AddAfter semantics, NOT a rate-limited requeue: it does not count toward
+	//                 NumRequeues. The next pass still goes through the rate-limit gate, and a watch
+	//                 event arriving first runs first.
+	//   errors        honoured ONLY on a nil error; a non-nil error keeps its existing backoff.
+	//
+	// It is deliberately not called "Requeue": in this runtime that means a rate-limited retry.
+	RecheckAfter time.Duration
 
 	// Conditions the handler wants recorded for this observation. The runtime applies them to the
 	// object BEFORE its own status write, so they ride that single write.
@@ -290,6 +311,11 @@ type Controller struct {
 	// Nil when no label selector is configured.
 	selector       labels.Selector
 	ownershipState ownershipState
+	// resyncPeriod is Options.ResyncInterval, the ceiling a handler's RecheckAfter is clamped to.
+	resyncPeriod time.Duration
+	// recheckPending holds, per object, the deadline of a recheck already queued, so a burst of passes
+	// that each carry a hint queues one recheck and not one each.
+	recheckPending sync.Map
 }
 
 var (
@@ -691,6 +717,7 @@ func New(sid *shortid.Shortid, opts Options) (*Controller, error) {
 		gracefulShutdownTimeout: gracefulShutdownTimeout,
 		ownership:               opts.Ownership,
 		selector:                selector,
+		resyncPeriod:            opts.ResyncInterval,
 	}, nil
 }
 
