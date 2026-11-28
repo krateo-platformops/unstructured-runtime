@@ -7,8 +7,23 @@ import (
 )
 
 // ErrCreateNotCommitted marks a create error the HANDLER knows the external system did not commit:
-// a validation refusal (a 4xx), a request that never left the process. Only such an error is safe to
-// retry blindly.
+// a validation refusal (a 4xx), a request that never left the process. Only such an error carries the
+// guarantee that the CREATE did not happen: the vendor refused, so nothing was created.
+//
+// THE RETRY IS NOT BLIND, since v1.34.0 (#130). This used to say a classified refusal was the only
+// error that could be retried without looking first, and that was true when written. It no longer is:
+// processItem now confirms the external resource is still absent BEFORE retrying, and ADOPTS it if
+// it appeared in the meantime (a route this controller did not take can create it between the
+// refusal and the retry). So "safe to retry" holds THROUGH that confirm, not unconditionally. Read
+// this together with meta.ExternalCreateRefusedUnconfirmed, the predicate that arms it, and whose
+// ties resolve in favour of "done" because the markers are second-granular.
+//
+// THE CONFIRM ADOPTS ONLY ON A DEFINITE YES. It is a top-level statement in processItem, after the
+// rate-limit gate, guarded by !ExternalCreateIncomplete and that same predicate. If the
+// existence check errors or cannot answer, it falls through to the previous blind-retry behaviour,
+// by design: that is the original intent, a classified refusal keeps retrying directly rather than
+// stopping where nothing can be observed. On a yes it stamps external-create-succeeded and returns
+// nil, which ENDS the retry series rather than rescheduling it.
 //
 // WHY THE DISTINCTION (Diego, 2026-11-16). Any other error is OUTCOME-UNKNOWN: a 5xx, a timeout or a
 // connection reset can arrive after the vendor committed. The runtime used to stamp every create
